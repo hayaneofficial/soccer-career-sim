@@ -24,8 +24,17 @@ WEIGHTS = {
 }
 THEORETICAL_MAX_SCORE = sum(WEIGHTS.values()) * 20
 
+# ★ランク定義
+TEAM_RANKS = {
+    "S": {"name": "欧州1部", "req_ca": 150, "avg_salary": 300000000},
+    "A": {"name": "J1上位", "req_ca": 120, "avg_salary": 80000000},
+    "B": {"name": "J1中下位", "req_ca": 100, "avg_salary": 30000000},
+    "C": {"name": "J2", "req_ca": 80, "avg_salary": 10000000},
+    "D": {"name": "J3/JFL", "req_ca": 50, "avg_salary": 4000000}
+}
+
 # --- Google Drive 接続用 ---
-# ★重要: ここにご自身のフォルダIDを入れてください（前回のままならそのままでOK）
+# ★ここにご自身のフォルダIDを入れてください
 FOLDER_ID = "1_IVb-lZUdM2B_n6yLQIjhCEA1HQhlbfH" 
 
 def get_drive_service():
@@ -47,7 +56,8 @@ class NPC:
         self.role = role
         self.relation = relation
         self.description = description
-        self.ca = ca
+        # ★安全策: caがNoneなら0.0にする
+        self.ca = ca if ca is not None else 0.0
 
     def to_dict(self):
         return {
@@ -60,15 +70,19 @@ class NPC:
     
     @classmethod
     def from_dict(cls, data):
+        # ★読み込み時の安全策: getで取得した後、Noneなら0.0にする
+        ca_val = data.get("ca")
+        if ca_val is None: ca_val = 0.0
+        
         return cls(
             data["name"], 
             data["role"], 
             data["relation"], 
             data.get("description", ""),
-            data.get("ca", 0.0)
+            ca_val
         )
 
-# --- Playerクラス (資金・給料システム追加版) ---
+# --- Playerクラス ---
 class Player:
     def __init__(self, name, position, age=18, attributes=None):
         self.name = name
@@ -78,10 +92,15 @@ class Player:
         self.hp = 100
         self.mp = 100
         
-        # ★NEW: 経済・契約データ
-        self.funds = 100000 # 所持金（初期10万円）
-        self.salary = 4800000 # 年俸（初期480万円 -> 月40万）
-        self.contract_years = 1 # 残り契約年数
+        # 経済・契約
+        self.funds = 100000
+        self.salary = 4800000
+        self.contract_years = 1
+        
+        # チーム情報
+        self.team_name = "南葛SC (初期)"
+        self.team_rank = "D"
+        self.offers = []
         
         self.attributes = {}
         for key in WEIGHTS.keys():
@@ -107,20 +126,54 @@ class Player:
         return False
     
     def advance_day(self, days=1):
-        """日付を進め、給料日判定を行う"""
         old_month = self.current_date.month
         self.current_date += datetime.timedelta(days=days)
         new_month = self.current_date.month
         
-        # ★月が変わったら給料日
+        logs = []
+        
+        # 給料日
         if old_month != new_month:
             monthly_pay = int(self.salary / 12)
             self.funds += monthly_pay
-            return f"💰 給料日が来ました！ +¥{monthly_pay:,}"
+            logs.append(f"💰 給料日が来ました！ +¥{monthly_pay:,}")
         
         # 自然回復
         self.hp = min(100, self.hp + 5)
-        return None
+        
+        # オファー抽選
+        current_rank_info = TEAM_RANKS.get(self.team_rank, TEAM_RANKS["D"])
+        next_ranks = [r for r, info in TEAM_RANKS.items() if info["req_ca"] <= self.ca + 10]
+        
+        if len(self.offers) < 3 and random.random() < 0.10:
+            if next_ranks:
+                target_rank = random.choice(next_ranks)
+                info = TEAM_RANKS[target_rank]
+                offer_salary = int(info["avg_salary"] * random.uniform(0.8, 1.2))
+                
+                prefixes = ["FC", "AS", "SC", "レアル", "ユナイテッド"]
+                cities = ["東京", "大阪", "横浜", "ロンドン", "マドリード", "ミュンヘン"]
+                team_name = f"{random.choice(prefixes)}{random.choice(cities)}"
+                
+                new_offer = {
+                    "team_name": team_name,
+                    "rank": target_rank,
+                    "salary": offer_salary,
+                    "contract_years": random.randint(1, 3)
+                }
+                self.offers.append(new_offer)
+                logs.append(f"📩 {team_name} ({target_rank}ランク) からオファーが届きました！")
+
+        return "\n".join(logs) if logs else None
+
+    def transfer_to(self, offer):
+        self.team_name = offer["team_name"]
+        self.team_rank = offer["rank"]
+        self.salary = offer["salary"]
+        self.contract_years = offer["contract_years"]
+        self.offers = []
+        self.npcs = [] 
+        return True
 
     def add_npc(self, npc):
         self.npcs.append(npc)
@@ -144,7 +197,9 @@ class Player:
             if my_score > 80: return "スタメン", "ライバル不在"
             else: return "ベンチ外", "実力不足"
             
-        rival_score = rival.ca 
+        # ★修正: ライバルのCAがNoneの場合のガード
+        rival_score = rival.ca if rival.ca is not None else 0.0
+        
         if my_score > rival_score + 2:
             return "スタメン", f"ライバル({rival.name})に勝利"
         elif my_score > rival_score - 2:
@@ -153,7 +208,6 @@ class Player:
             return "ベンチ", f"ライバル({rival.name})の後塵"
 
     def to_dict(self):
-        # ★資金データを保存するように更新
         return {
             "name": self.name,
             "position": self.position,
@@ -167,7 +221,10 @@ class Player:
             "npcs": [npc.to_dict() for npc in self.npcs],
             "funds": self.funds,
             "salary": self.salary,
-            "contract_years": self.contract_years
+            "contract_years": self.contract_years,
+            "team_name": self.team_name,
+            "team_rank": self.team_rank,
+            "offers": self.offers
         }
 
     @classmethod
@@ -185,11 +242,12 @@ class Player:
         p.mp = data["mp"]
         p.ca = data["ca"]
         p.pa = data["pa"]
-        
-        # ★資金データを読み込む（古いデータ用の安全策付き）
         p.funds = data.get("funds", 100000)
         p.salary = data.get("salary", 4800000)
         p.contract_years = data.get("contract_years", 1)
+        p.team_name = data.get("team_name", "南葛SC (初期)")
+        p.team_rank = data.get("team_rank", "D")
+        p.offers = data.get("offers", [])
 
         if "npcs" in data:
             p.npcs = [NPC.from_dict(n) for n in data["npcs"]]
@@ -202,14 +260,12 @@ class MatchState:
         self.score_enemy = 0
         self.rows = [1, 2, 3, 4, 5, 6]
         self.cols = ["A", "B", "C", "D", "E"]
-        
         if "FW" in player_position or "WG" in player_position:
             self.player_pos = [2, "C"]
         elif "MF" in player_position:
             self.player_pos = [3, "C"]
         else:
             self.player_pos = [5, "C"]
-            
         self.ball_pos = self.player_pos.copy()
 
     def get_grid_df(self):

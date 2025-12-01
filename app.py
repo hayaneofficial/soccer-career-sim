@@ -20,13 +20,14 @@ with st.sidebar:
     if st.session_state.game_phase == "main":
         p = st.session_state.player
         
-        # ★NEW: 資産・契約情報の表示エリア
+        # ★NEW: 所属クラブ表示
+        st.info(f"🏟️ **{p.team_name}** ({p.team_rank}ランク)")
+        
         st.divider()
         st.subheader("💰 資産・契約")
         st.write(f"**所持金: ¥{p.funds:,}**")
-        st.caption(f"年俸: ¥{p.salary:,} (月給: ¥{int(p.salary/12):,})")
-        st.caption(f"契約残り: {p.contract_years}年")
-
+        st.caption(f"年俸: ¥{p.salary:,}")
+        
         st.divider()
         st.subheader("👥 チーム状況")
         status, reason = p.get_squad_status()
@@ -89,7 +90,6 @@ elif st.session_state.game_phase == "create":
             """
             
             res = model.generate_content(prompt)
-            # 安全装置
             try: data = json.loads(res.text)
             except: data = {}
             if isinstance(data, list): data = data[0] if data else {}
@@ -116,11 +116,11 @@ elif st.session_state.game_phase == "main":
     p = st.session_state.player
     st.title(f"⚽ {p.name} の日常")
     
-    # ★NEW: タブ機能（行動とショップを分ける）
-    tab1, tab2 = st.tabs(["🏃 行動", "🛍️ ショップ"])
+    # ★NEW: 移籍タブを追加
+    tab1, tab2, tab3 = st.tabs(["🏃 行動", "🛍️ ショップ", "📩 移籍"])
     
+    # --- タブ1: 行動 ---
     with tab1:
-        # 試合出場判定
         status, reason = p.get_squad_status()
         if "スタメン" in status and p.hp > 60:
             if st.button("🏟️ 公式戦に出場する"):
@@ -135,7 +135,6 @@ elif st.session_state.game_phase == "main":
         else:
             st.error(f"🔒 試合に出られません（理由: {reason}）")
         
-        # チャット
         for m in st.session_state.messages:
             with st.chat_message(m["role"]): st.markdown(m["content"])
 
@@ -161,7 +160,6 @@ elif st.session_state.game_phase == "main":
             
             try:
                 res = model.generate_content(order)
-                # 安全装置
                 try: data = json.loads(res.text)
                 except: data = {}
                 if isinstance(data, list): data = data[0] if data else {}
@@ -177,54 +175,93 @@ elif st.session_state.game_phase == "main":
                 if manager: manager.relation = max(-100, min(100, manager.relation + data.get("relation_change", 0)))
                 if rival: rival.ca += data.get("rival_growth_ca", 0.05)
 
-                # ★NEW: 給料日チェック
-                pay_log = p.advance_day(1)
-                if pay_log:
-                    st.toast(pay_log, icon="💰")
-                    # チャットログにも残す
-                    st.session_state.messages.append({"role": "assistant", "content": f"**{pay_log}**"})
+                # 給料＆オファー通知
+                daily_log = p.advance_day(1)
+                if daily_log:
+                    st.toast("通知あり！", icon="🔔")
+                    st.session_state.messages.append({"role": "assistant", "content": f"**{daily_log}**"})
 
                 game_data.save_game(p)
                 st.rerun()
             except Exception as e:
                 st.error(f"エラー: {e}")
 
-    # ★NEW: ショップタブの実装
+    # --- タブ2: ショップ ---
     with tab2:
         st.subheader("🛍️ アイテムショップ")
         st.write(f"所持金: **¥{p.funds:,}**")
-        st.info("お金を使ってコンディション回復や能力アップができます。")
-        
-        # 商品リスト
         items = [
             {"name": "高級プロテイン", "price": 5000, "effect": "HP+30", "hp": 30, "mp": 0},
             {"name": "戦術分析書", "price": 10000, "effect": "MP+20 & Decisions微増", "hp": 0, "mp": 20, "stat": "Decisions"},
             {"name": "温泉旅行", "price": 50000, "effect": "HP/MP全快", "hp": 100, "mp": 100},
             {"name": "最新スパイク", "price": 100000, "effect": "Pace/Agility強化", "hp": 0, "mp": 10, "stat": "Pace"}
         ]
-        
         for item in items:
             c_name, c_effect, c_btn = st.columns([2, 2, 1])
             c_name.write(f"**{item['name']}** (¥{item['price']:,})")
             c_effect.caption(item['effect'])
-            
             if c_btn.button("購入", key=item['name']):
                 if p.funds >= item['price']:
                     p.funds -= item['price']
                     p.hp = min(100, p.hp + item['hp'])
                     p.mp = min(100, p.mp + item['mp'])
-                    if "stat" in item:
-                        p.grow_attribute(item['stat'], 0.5) # 能力も少し上がる
-                        st.toast(f"{item['name']}を購入！能力UP！")
-                    else:
-                        st.toast(f"{item['name']}を購入！コンディション回復！")
+                    if "stat" in item: p.grow_attribute(item['stat'], 0.5)
+                    st.toast(f"{item['name']}を購入！")
                     game_data.save_game(p)
                     st.rerun()
                 else:
                     st.error("お金が足りません！")
 
-# ■ 試合画面
+    # --- タブ3: 移籍市場 (NEW!) ---
+    with tab3:
+        st.subheader("📩 届いているオファー")
+        if not p.offers:
+            st.info("現在、オファーはありません。活躍して注目を集めましょう。")
+        else:
+            for i, offer in enumerate(p.offers):
+                with st.container(border=True):
+                    cols = st.columns([3, 2, 2])
+                    cols[0].markdown(f"### {offer['team_name']}")
+                    cols[0].caption(f"ランク: {offer['rank']}")
+                    cols[1].metric("提示年俸", f"¥{offer['salary']:,}", delta=f"{offer['salary'] - p.salary:,}")
+                    cols[2].write(f"契約: {offer['contract_years']}年")
+                    
+                    if st.button("契約書にサインする ✍️", key=f"sign_{i}"):
+                        if api_key:
+                            # 移籍処理
+                            p.transfer_to(offer)
+                            
+                            # 新天地のNPC生成
+                            try:
+                                genai.configure(api_key=api_key)
+                                model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
+                                prompt = f"""
+                                プレイヤーが新チーム「{p.team_name}」に移籍しました。
+                                ランク:{p.team_rank}, ポジション:{p.position}
+                                
+                                指示: 新しい「監督」と「ライバル」を作成してJSON出力。
+                                ライバルのCAは {p.ca + 5} 程度にすること。
+                                Format: {{ "manager": {{ "name": "...", "description": "..." }}, "rival": {{ "name": "...", "description": "...", "ca": 120.0 }} }}
+                                """
+                                res = model.generate_content(prompt)
+                                data = json.loads(res.text)
+                                mgr = data.get("manager", {"name":"新監督", "description":""})
+                                p.add_npc(game_data.NPC(mgr.get("name"), "監督", 0, mgr.get("description")))
+                                riv = data.get("rival", {"name":"新ライバル", "description":"", "ca":p.ca+5})
+                                p.add_npc(game_data.NPC(riv.get("name"), "ライバル", 0, riv.get("description"), ca=riv.get("ca")))
+                                
+                                st.balloons()
+                                st.session_state.messages = [{"role": "assistant", "content": f"🎉 **{p.team_name}** への移籍が完了しました！\n新しい仲間たちが待っています。"}]
+                                game_data.save_game(p)
+                                st.rerun()
+                            except:
+                                st.error("AI生成エラー")
+                        else:
+                            st.error("APIキーが必要です")
+
+# ■ 試合画面 (変更なし)
 elif st.session_state.game_phase == "match":
+    # (前回と同じコード)
     p = st.session_state.player
     m_state = st.session_state.match_state
     
@@ -252,7 +289,6 @@ elif st.session_state.game_phase == "match":
             Format: {{ "story": "...", "result": "success", "score_ally_add": 0, "new_position_row": 0, "new_position_col": "C", "is_match_end": false }}
             """
             res = model.generate_content(match_order)
-            # 安全装置
             try: data = json.loads(res.text)
             except: data = {}
             if isinstance(data, list): data = data[0] if data else {}
@@ -285,14 +321,10 @@ elif st.session_state.game_phase == "match":
                     st.session_state.game_phase = "main"
                     p.hp = max(0, p.hp - 30)
                     p.advance_day(1)
-                    
-                    # ★NEW: 勝利ボーナス
                     if m_state.score_ally > m_state.score_enemy:
                         win_bonus = 100000
                         p.funds += win_bonus
                         st.toast(f"勝利ボーナス +¥{win_bonus:,} GET!", icon="💰")
-                        st.session_state.messages.append({"role": "assistant", "content": f"**勝利ボーナス ¥{win_bonus:,} を獲得しました！**"})
-                    
                     game_data.save_game(p)
                     st.rerun()
             else:
