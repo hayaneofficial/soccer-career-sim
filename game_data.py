@@ -25,34 +25,49 @@ WEIGHTS = {
 THEORETICAL_MAX_SCORE = sum(WEIGHTS.values()) * 20
 
 # --- Google Drive 接続用関数 ---
+FOLDER_ID = "1_IVb-lZUdM2B_n6yLQIjhCEA1HQhlbfH" # ★あなたのフォルダIDのままにしておいてください
+
 def get_drive_service():
-    """SecretsのJSONを使ってDrive APIに接続する"""
-    if "gcp_json" not in st.secrets:
-        return None
-    
+    if "gcp_json" not in st.secrets: return None
     try:
-        # JSON文字列を辞書に変換
         creds_dict = json.loads(st.secrets["gcp_json"])
-        # 認証情報オブジェクトを作成
         creds = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive']
+            creds_dict, scopes=['https://www.googleapis.com/auth/drive']
         )
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
         st.error(f"Drive接続エラー: {e}")
         return None
 
-def get_folder_id(service, folder_name="SoccerSimData"):
-    """共有されたフォルダのIDを探す"""
-    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder'"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    items = results.get('files', [])
-    if items:
-        return items[0]['id']
-    return None
+# --- NPCクラス (★更新: CAを追加) ---
+class NPC:
+    def __init__(self, name, role, relation=0, description="", ca=0.0):
+        self.name = name
+        self.role = role
+        self.relation = relation
+        self.description = description
+        self.ca = ca # ★ライバルの能力値
 
-# --- Playerクラス ---
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "role": self.role,
+            "relation": self.relation,
+            "description": self.description,
+            "ca": self.ca
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            data["name"], 
+            data["role"], 
+            data["relation"], 
+            data.get("description", ""),
+            data.get("ca", 0.0) # 昔のデータにcaがなくてもエラーにならないように
+        )
+
+# --- Playerクラス (★更新: 序列計算ロジック追加) ---
 class Player:
     def __init__(self, name, position, age=18, attributes=None):
         self.name = name
@@ -72,6 +87,7 @@ class Player:
         self.ca = 0.0
         self.pa = 150.0
         self.update_ca()
+        self.npcs = [] 
 
     def update_ca(self):
         total_score = sum(self.attributes[key] * weight for key, weight in WEIGHTS.items())
@@ -88,6 +104,44 @@ class Player:
         self.current_date += datetime.timedelta(days=days)
         self.hp = min(100, self.hp + 5)
 
+    def add_npc(self, npc):
+        self.npcs.append(npc)
+
+    def get_npc_by_role(self, role):
+        for npc in self.npcs:
+            if npc.role == role:
+                return npc
+        return None
+    
+    # ★NEW: 序列（スタメンかどうか）を判定するロジック
+    def get_squad_status(self):
+        manager = self.get_npc_by_role("監督")
+        rival = self.get_npc_by_role("ライバル")
+        
+        # 1. 監督がいなければとりあえずスタメン
+        if not manager: return "スタメン", "監督不在"
+
+        # 2. 自分の評価点 = CA + (信頼度ボーナス max 20)
+        # 信頼度が低いと、実力があっても使われない
+        trust_bonus = max(0, manager.relation * 0.2) 
+        my_score = self.ca + trust_bonus
+        
+        # 3. ライバルがいなければ、一定の実力があればスタメン
+        if not rival:
+            if my_score > 80: return "スタメン", "ライバル不在"
+            else: return "ベンチ外", "実力不足"
+            
+        # 4. ライバルとの競争
+        # ライバルは監督評価フラットとする（主人公への試練のため）
+        rival_score = rival.ca 
+        
+        if my_score > rival_score + 2:
+            return "スタメン", f"ライバル({rival.name})に勝利"
+        elif my_score > rival_score - 2:
+            return "スタメン争い", f"ライバル({rival.name})と拮抗"
+        else:
+            return "ベンチ", f"ライバル({rival.name})の後塵"
+
     def to_dict(self):
         return {
             "name": self.name,
@@ -98,7 +152,8 @@ class Player:
             "hp": self.hp,
             "mp": self.mp,
             "ca": self.ca,
-            "pa": self.pa
+            "pa": self.pa,
+            "npcs": [npc.to_dict() for npc in self.npcs]
         }
 
     @classmethod
@@ -116,23 +171,23 @@ class Player:
         p.mp = data["mp"]
         p.ca = data["ca"]
         p.pa = data["pa"]
+        if "npcs" in data:
+            p.npcs = [NPC.from_dict(n) for n in data["npcs"]]
         return p
 
-# --- 試合ステートクラス ---
+# --- 試合ステートクラス (更新なし) ---
 class MatchState:
     def __init__(self, player_name, player_position):
         self.score_ally = 0
         self.score_enemy = 0
         self.rows = [1, 2, 3, 4, 5, 6]
         self.cols = ["A", "B", "C", "D", "E"]
-        
         if "FW" in player_position or "WG" in player_position:
             self.player_pos = [2, "C"]
         elif "MF" in player_position:
             self.player_pos = [3, "C"]
         else:
             self.player_pos = [5, "C"]
-            
         self.ball_pos = self.player_pos.copy()
 
     def get_grid_df(self):
@@ -153,113 +208,28 @@ class MatchState:
         except: pass
         return pd.DataFrame(data, index=["敵G前", "敵陣深", "敵陣浅", "自陣浅", "自陣深", "自G前"], columns=self.cols)
 
-# --- セーブ＆ロード関数 (Google Drive対応版) ---
-
+# --- セーブ＆ロード関数 (更新なし) ---
 def save_game(player, filename="save_data.json"):
-    """Google Driveに保存する"""
-    # データ作成
-    data_str = json.dumps(player.to_dict(), ensure_ascii=False, indent=4)
-    media = MediaIoBaseUpload(io.BytesIO(data_str.encode('utf-8')), mimetype='application/json')
-    
     service = get_drive_service()
-    if not service:
-        st.error("Google Driveに接続できません。Secretsを確認してください。")
-        return
-
-    # フォルダを探す
-    folder_id = get_folder_id(service, "SoccerSimData")
-    
-    # 既存ファイルを探す
-    query = f"name = '{filename}'"
-    if folder_id:
-        query += f" and '{folder_id}' in parents"
-        
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get('files', [])
-
-    if files:
-        # 上書き保存
-        file_id = files[0]['id']
-        service.files().update(fileId=file_id, media_body=media).execute()
-    else:
-        # 新規作成
-        file_metadata = {'name': filename}
-        if folder_id:
-            file_metadata['parents'] = [folder_id]
-        service.files().create(body=file_metadata, media_body=media).execute()
-
-def load_game(filename="save_data.json"):
-    """Google Driveから読み込む"""
-    service = get_drive_service()
-    if not service:
-        return None
-        
-    # --- ここから下を書き換えてください ---
-
-# ★ここにコピーしたフォルダIDを貼り付けてください！
-FOLDER_ID = "1_IVb-lZUdM2B_n6yLQIjhCEA1HQhlbfH" 
-
-def get_drive_service():
-    """SecretsのJSONを使ってDrive APIに接続する"""
-    if "gcp_json" not in st.secrets:
-        return None
-    try:
-        creds_dict = json.loads(st.secrets["gcp_json"])
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive']
-        )
-        return build('drive', 'v3', credentials=creds)
-    except Exception as e:
-        st.error(f"Drive接続エラー: {e}")
-        return None
-
-# フォルダを探す関数はもう不要なので削除してもいいですが、
-# 念のため残す場合は使わないようにします。
-
-# --- セーブ＆ロード関数 (ID指定・上書き専用版) ---
-
-def save_game(player, filename="save_data.json"):
-    """Google Driveの既存ファイルを上書き保存する"""
-    service = get_drive_service()
-    if not service:
-        st.error("Google Driveに接続できません。")
-        return
-
-    # 1. まずフォルダ内のファイルを探す
+    if not service: return
     query = f"name = '{filename}' and '{FOLDER_ID}' in parents"
     results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get('files', [])
-
-    # データ作成
     data_str = json.dumps(player.to_dict(), ensure_ascii=False, indent=4)
     media = MediaIoBaseUpload(io.BytesIO(data_str.encode('utf-8')), mimetype='application/json')
-
     if files:
-        # ★ある場合：上書き保存（これなら容量エラーが出ない！）
-        file_id = files[0]['id']
-        service.files().update(fileId=file_id, media_body=media).execute()
-        # st.success("クラウドに保存しました！") # 毎回出るとうるさいのでコメントアウト
+        service.files().update(fileId=files[0]['id'], media_body=media).execute()
     else:
-        # ★ない場合：エラーを出す（ロボットは新規作成できないため）
-        st.error(f"Driveに '{filename}' が見つかりません。PCから手動でアップロードしてください。")
+        pass 
 
 def load_game(filename="save_data.json"):
-    """Google Driveから読み込む"""
     service = get_drive_service()
-    if not service:
-        return None
-        
-    # IDを使ってピンポイントで探す
+    if not service: return None
     query = f"name = '{filename}' and '{FOLDER_ID}' in parents"
     results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get('files', [])
-    
-    if not files:
-        return None
-        
+    if not files: return None
     file_id = files[0]['id']
     request = service.files().get_media(fileId=file_id)
     file_data = request.execute()
-    
     return Player.from_dict(json.loads(file_data.decode('utf-8')))

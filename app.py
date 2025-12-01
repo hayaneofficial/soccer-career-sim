@@ -6,15 +6,11 @@ import random
 
 st.set_page_config(page_title="サッカーキャリアSim", layout="wide")
 
-# --- セッションステート初期化 ---
-if "player" not in st.session_state:
-    st.session_state.player = None
-if "game_phase" not in st.session_state:
-    st.session_state.game_phase = "start"
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "match_state" not in st.session_state:
-    st.session_state.match_state = None
+# --- 初期化 ---
+if "player" not in st.session_state: st.session_state.player = None
+if "game_phase" not in st.session_state: st.session_state.game_phase = "start"
+if "messages" not in st.session_state: st.session_state.messages = []
+if "match_state" not in st.session_state: st.session_state.match_state = None
 
 # --- サイドバー ---
 with st.sidebar:
@@ -22,10 +18,35 @@ with st.sidebar:
     api_key = st.text_input("Gemini APIキー", type="password")
     
     if st.session_state.game_phase == "main":
+        p = st.session_state.player
+        
+        st.divider()
+        st.subheader("👥 チーム状況")
+        
+        # 序列の判定
+        status, reason = p.get_squad_status()
+        st.info(f"現在の序列: **{status}**\n\n({reason})")
+        
+        # 監督
+        manager = p.get_npc_by_role("監督")
+        if manager:
+            trust_val = (manager.relation + 100) / 200
+            st.progress(trust_val, text=f"監督信頼度: {manager.relation}")
+        
+        # ライバル表示
+        rival = p.get_npc_by_role("ライバル")
+        if rival:
+            st.write(f"⚔️ **ライバル: {rival.name}**")
+            st.caption(f"CA: {rival.ca:.1f} ({rival.description})")
+            diff = p.ca - rival.ca
+            if diff > 0: st.success(f"あなたの方が強い (+{diff:.1f})")
+            else: st.error(f"ライバルの方が強い ({diff:.1f})")
+
+        st.divider()
         if st.button("💾 セーブ"):
-            game_data.save_game(st.session_state.player)
+            game_data.save_game(p)
             st.success("保存完了")
-    
+
     if st.button("📂 ロード"):
         loaded = game_data.load_game()
         if loaded:
@@ -34,80 +55,117 @@ with st.sidebar:
             st.session_state.messages = [{"role": "assistant", "content": "ロードしました。"}]
             st.rerun()
 
-# --- フェーズ分岐 ---
+# --- フェーズ処理 ---
 
-# ■ スタート画面
+# ■ スタート
 if st.session_state.game_phase == "start":
     st.title("⚽ Football Career AI")
     if st.button("▶ 新しくゲームを始める"):
         st.session_state.game_phase = "create"
         st.rerun()
 
-# ■ キャラ作成画面
+# ■ キャラ作成 (ここに安全装置を追加しました！)
 elif st.session_state.game_phase == "create":
     st.title("📝 選手登録")
-    if not api_key:
-        st.error("サイドバーでAPIキーを設定してください")
-        st.stop()
+    if not api_key: st.stop()
 
     c1, c2 = st.columns(2)
     with c1:
         name = st.text_input("名前", "佐藤 蹴斗")
-        age = st.number_input("年齢", 15, 35, 18)
+        age = st.number_input("年齢", 18)
     with c2:
-        position = st.selectbox("ポジション", ["CF", "RWG", "LWG", "OMF", "CMF", "DMF", "RSB", "LSB", "CB", "GK"])
-        style = st.text_area("経歴", "高校時代は無名だったが、50m5秒台の俊足を武器に活躍した。")
+        position = st.selectbox("ポジション", ["CF", "OMF", "LWG", "RWG", "CMF", "DMF", "CB", "SB", "GK"])
+        style = st.text_area("経歴", "高校時代は無名だったが...")
 
     if st.button("作成"):
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
-            prompt = f"名前:{name}, 年齢:{age}, ポジション:{position}, 経歴:{style}。ここから能力値(1.0-20.0)を推論しJSON出力。{{'attributes': {{...}}, 'comment': '...'}}"
+            
+            prompt = f"""
+            以下に基づき初期データ生成。JSON出力。
+            選手: {name}, {age}歳, {position}, 経歴: {style}
+            
+            指示:
+            1. 能力値(attributes)作成。
+            2. NPC「監督」作成（relation=0）。
+            3. NPC「ライバル」を一人作成。
+               - 同じポジション。
+               - 能力(ca)は、プレイヤーの初期CAより「やや高い」設定にすること（壁となる存在）。
+               - 性格は「エリート」「努力家」など。
+            
+            Format:
+            {{
+                "attributes": {{...}},
+                "manager": {{ "name": "...", "description": "..." }},
+                "rival": {{ "name": "...", "description": "...", "ca": 110.5 }},
+                "comment": "スカウトコメント"
+            }}
+            """
+            
             res = model.generate_content(prompt)
-            data = json.loads(res.text)
+            
+            # ★安全装置: 文字列をJSONにする
+            try:
+                data = json.loads(res.text)
+            except:
+                st.error("AIからのデータ読み取りに失敗しました。もう一度押してください。")
+                st.stop()
+
+            # ★安全装置: もしリスト形式で返ってきたら、中身を取り出す
+            if isinstance(data, list):
+                if len(data) > 0:
+                    data = data[0]
+                else:
+                    st.error("AIから空のデータが返ってきました。")
+                    st.stop()
+            
+            # プレイヤー
             p = game_data.Player(name, position, age, attributes=data.get("attributes"))
+            
+            # 監督追加
+            mgr_data = data.get("manager", {"name": "監督", "description": "普通"})
+            p.add_npc(game_data.NPC(mgr_data.get("name", "監督"), "監督", 0, mgr_data.get("description", "")))
+            
+            # ライバル追加
+            riv_data = data.get("rival", {"name": "ライバル", "description": "強敵", "ca": p.ca + 5})
+            rival_npc = game_data.NPC(riv_data.get("name", "ライバル"), "ライバル", 0, riv_data.get("description", ""), ca=riv_data.get("ca", p.ca + 5))
+            p.add_npc(rival_npc)
+            
             st.session_state.player = p
             st.session_state.game_phase = "main"
-            st.session_state.messages = [{"role": "assistant", "content": f"スカウト「{data.get('comment')}」\n入団おめでとう！"}]
+            st.session_state.messages = [{"role": "assistant", "content": f"【入団】\n{data.get('comment', '入団手続き完了')}\n\n同じポジションには、{rival_npc.name}（CA:{rival_npc.ca:.1f}）という絶対的なレギュラーがいます。\n彼からスタメンを奪うのが最初の目標です！"}]
             st.rerun()
+            
         except Exception as e:
             st.error(f"エラー: {e}")
 
-# ■ メイン（日常）画面
+# ■ メイン画面
 elif st.session_state.game_phase == "main":
     p = st.session_state.player
     st.title(f"⚽ {p.name} の日常")
-    st.caption(f"📅 {p.current_date} | ❤️HP:{p.hp} 🧠MP:{p.mp} | CA:{p.ca:.1f}")
     
-    # 試合に出るボタン（HPが元気なときだけ）
-    if p.hp > 60:
+    # 試合出場判定
+    status, reason = p.get_squad_status()
+    
+    if "スタメン" in status and p.hp > 60:
         if st.button("🏟️ 公式戦に出場する"):
-            st.session_state.game_phase = "match"
-            # まず試合状態を作る
             ms = game_data.MatchState(p.name, p.position)
             st.session_state.match_state = ms
-            
-            # ★座標を取得してテキストに埋め込む
             pos_r, pos_c = ms.player_pos
-            grid_str = f"{pos_r}{pos_c}"
-            
-            # 行番号に応じた描写の変化（簡易版）
-            location_desc = "相手ゴール前" if pos_r <= 2 else "中盤" if pos_r <= 4 else "自陣深く"
-            
-            start_scene = f"後半35分、スコアは0-0。{location_desc}（{grid_str}）でボールを受けた！"
-            
-            st.session_state.messages = [{"role": "assistant", "content": start_scene}]
+            st.session_state.game_phase = "match"
+            st.session_state.messages = [{"role": "assistant", "content": f"後半35分、スコア0-0。{pos_r}{pos_c}でボールを受けた！"}]
             st.rerun()
+    elif p.hp <= 60:
+        st.warning("⚠️ 体力不足")
     else:
-        st.warning("⚠️ 体力が足りません。休養してください。")
-
-    # チャット・入力エリア
+        st.error(f"🔒 試合に出られません（理由: {reason}）")
+    
+    # チャット
     for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+        with st.chat_message(m["role"]): st.markdown(m["content"])
 
-    # --- ここから書き換え ---
-    if prompt := st.chat_input("行動を入力（例：走り込み、休養）"):
+    if prompt := st.chat_input("行動を入力"):
         if not api_key: st.stop()
         with st.chat_message("user"): st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -115,79 +173,75 @@ elif st.session_state.game_phase == "main":
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
         
-        # プロンプト（少し厳密にしました）
+        manager = p.get_npc_by_role("監督")
+        rival = p.get_npc_by_role("ライバル")
+        
+        mgr_info = f"{manager.name}(信頼:{manager.relation})" if manager else "なし"
+        riv_info = f"{rival.name}(CA:{rival.ca})" if rival else "なし"
+
         order = f"""
         日時:{p.current_date}, 選手:{p.name}, 行動:{prompt}
-        指示: 結果を必ず単一のJSONオブジェクトで出力してください。リスト配列にはしないでください。
-        Format: {{ "story": "...", "grow_stats": {{...}}, "hp_cost": 10, "mp_cost": 0 }}
+        監督:{mgr_info}, ライバル:{riv_info}
+        
+        指示:
+        1. ユーザーの行動結果(story, grow_stats, hp/mp_cost, relation_change)を出力。
+        2. さらに「ライバルも独自に練習している」。ライバルの成長値(rival_growth_ca)を 0.0〜0.3 の間で決めて出力。
+        3. storyには、ライバルの様子（「〇〇も負けじと走り込んでいる」など）も含めて。
+        4. 必ず単一のJSONオブジェクトで出力（リスト禁止）。
+        
+        Format: {{ 
+            "story": "...", 
+            "grow_stats": {{...}}, "hp_cost": 10, "mp_cost": 0, "relation_change": 0,
+            "rival_growth_ca": 0.1
+        }}
         """
         
         try:
             res = model.generate_content(order)
-            text_data = res.text
             
-            # --- 安全装置エリア ---
-            try:
-                data = json.loads(text_data)
-            except:
-                # JSONとして読めなかった場合の保険
-                data = {"story": "（判定エラー：AIの返答が読み取れませんでした）", "grow_stats": {}, "hp_cost": 0, "mp_cost": 0}
-
-            # もしリスト（[]）で返ってきたら、中身の1つ目を取り出す
-            if isinstance(data, list):
-                if len(data) > 0:
-                    data = data[0]
-                else:
-                    data = {}
+            # ★安全装置
+            try: data = json.loads(res.text)
+            except: data = {}
+            if isinstance(data, list): data = data[0] if data else {}
+            if not isinstance(data, dict): data = {}
             
-            # もし辞書型（{}）じゃなかったら強制的に空にする
-            if not isinstance(data, dict):
-                data = {"story": str(text_data), "grow_stats": {}, "hp_cost": 0, "mp_cost": 0}
-            # --------------------
-            
-            # データ更新
             story = data.get("story", "描写なし")
             st.markdown(story)
             st.session_state.messages.append({"role": "assistant", "content": story})
             
             p.hp = max(0, min(100, p.hp - data.get("hp_cost", 0)))
             p.mp = max(0, min(100, p.mp - data.get("mp_cost", 0)))
-            for k, v in data.get("grow_stats", {}).items(): 
-                p.grow_attribute(k, v)
-                
+            for k, v in data.get("grow_stats", {}).items(): p.grow_attribute(k, v)
+            if manager: manager.relation = max(-100, min(100, manager.relation + data.get("relation_change", 0)))
+            
+            if rival:
+                growth = data.get("rival_growth_ca", 0.05)
+                rival.ca += growth
+                st.toast(f"ライバルCA +{growth:.2f}")
+
             p.advance_day(1)
             game_data.save_game(p)
             st.rerun()
-
+            
         except Exception as e:
-            st.error(f"通信エラー: {e}")
+            st.error(f"エラー: {e}")
 
-# ■ 試合（マッチ）画面
+# ■ 試合画面
 elif st.session_state.game_phase == "match":
     p = st.session_state.player
     m_state = st.session_state.match_state
     
     st.title("🏟️ 公式戦")
-    
-    # スコアボードとグリッド表示
     c1, c2 = st.columns([1, 2])
     with c1:
         st.metric("SCORE", f"{m_state.score_ally} - {m_state.score_enemy}")
-        # グリッドを表として表示
-        st.dataframe(
-            m_state.get_grid_df(), 
-            use_container_width=True, # 横幅いっぱいに広げる
-            height=250 # 高さを固定
-        )
+        st.dataframe(m_state.get_grid_df(), use_container_width=True, height=250)
         
     with c2:
-        # 試合中のチャット
         for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
                 
-        # 試合用入力フォーム
-        if prompt := st.chat_input("プレーを選択（例：左(2A)へドリブルしてクロス！）"):
+        if prompt := st.chat_input("プレーを選択"):
             if not api_key: st.stop()
             with st.chat_message("user"): st.markdown(prompt)
             st.session_state.messages.append({"role": "user", "content": prompt})
@@ -195,73 +249,51 @@ elif st.session_state.game_phase == "match":
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
             
-            # 試合用の特殊プロンプト
             match_order = f"""
-            状況: サッカーの試合中。
-            主人公: {p.name} ({p.position}), 能力:{p.attributes}
-            現在地: {m_state.player_pos}
-            ユーザーのプレー宣言: {prompt}
-            
-            指示:
-            1. プレーの成否を能力値に基づいて判定してください。
-            2. 成功なら 'result': 'success', 失敗なら 'failure'。
-            3. 次の展開（移動先グリッドやスコア変動）を決めてください。
-            4. 結果描写(story)は臨場感たっぷりに。
-            
-            出力JSON:
-            {{
-                "story": "実況描写",
-                "result": "success",
-                "score_ally_add": 1 (得点なら1, なしなら0),
-                "new_position_row": 2,
-                "new_position_col": "A",
-                "is_match_end": false (試合終了ならtrue)
-            }}
+            状況: 試合中。主人公:{p.name}, 能力:{p.attributes}, 位置:{m_state.player_pos}
+            行動: {prompt}
+            Format: {{ "story": "...", "result": "success", "score_ally_add": 0, "new_position_row": 0, "new_position_col": "C", "is_match_end": false }}
             """
-            
             res = model.generate_content(match_order)
-            data = json.loads(res.text)
             
-            # 試合データの更新
+            # ★ここにも安全装置
+            try: data = json.loads(res.text)
+            except: data = {}
+            if isinstance(data, list): data = data[0] if data else {}
+            if not isinstance(data, dict): data = {}
+
             story = data.get("story", "")
             m_state.score_ally += data.get("score_ally_add", 0)
-            
-            # 位置更新
             new_r = data.get("new_position_row")
             new_c = data.get("new_position_col")
             if new_r and new_c:
-                m_state.player_pos = (new_r, new_c)
-                # ボールも一緒に移動したとみなす
-                m_state.ball_pos = (new_r, new_c)
+                m_state.player_pos = [int(new_r), str(new_c)]
+                m_state.ball_pos = [int(new_r), str(new_c)]
             
             st.markdown(story)
             st.session_state.messages.append({"role": "assistant", "content": story})
             
-            # 試合終了判定
             if data.get("is_match_end"):
-                st.balloons() # 風船を飛ばす演出
+                st.balloons()
                 st.success("試合終了！")
+                manager = p.get_npc_by_role("監督")
+                if manager:
+                    bonus = 5 if m_state.score_ally > m_state.score_enemy else 1
+                    manager.relation += bonus
+                
+                rival = p.get_npc_by_role("ライバル")
+                if rival and m_state.score_ally > 0:
+                    st.toast("活躍によりライバルとの序列が変動！")
+
                 if st.button("ロッカールームへ戻る"):
                     st.session_state.game_phase = "main"
-                    # 試合の疲れを反映
                     p.hp = max(0, p.hp - 30)
                     p.advance_day(1)
                     game_data.save_game(p)
                     st.rerun()
             else:
                 st.rerun()
-
-                # 位置更新の修正版
-            new_r = data.get("new_position_row")
-            new_c = data.get("new_position_col")
-            if new_r and new_c:
-                # int() で囲んで、文字がきても数字に直す！
-                m_state.player_pos = [int(new_r), str(new_c)]
-                m_state.ball_pos = [int(new_r), str(new_c)]
-                
-    # 試合をやめるボタン（デバッグ用）
+    
     if st.sidebar.button("試合終了（強制）"):
         st.session_state.game_phase = "main"
         st.rerun()
-
-        
