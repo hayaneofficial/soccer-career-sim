@@ -106,6 +106,7 @@ elif st.session_state.game_phase == "main":
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
+    # --- ここから書き換え ---
     if prompt := st.chat_input("行動を入力（例：走り込み、休養）"):
         if not api_key: st.stop()
         with st.chat_message("user"): st.markdown(prompt)
@@ -114,22 +115,52 @@ elif st.session_state.game_phase == "main":
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
         
-        order = f"日時:{p.current_date}, 選手:{p.name}, 行動:{prompt}。成長とHPMP消費をJSON出力。{{'story':'...', 'grow_stats':{{...}}, 'hp_cost':10, 'mp_cost':0}}"
+        # プロンプト（少し厳密にしました）
+        order = f"""
+        日時:{p.current_date}, 選手:{p.name}, 行動:{prompt}
+        指示: 結果を必ず単一のJSONオブジェクトで出力してください。リスト配列にはしないでください。
+        Format: {{ "story": "...", "grow_stats": {{...}}, "hp_cost": 10, "mp_cost": 0 }}
+        """
         
-        res = model.generate_content(order)
-        data = json.loads(res.text)
-        
-        # データ更新
-        story = data.get("story", "")
-        st.markdown(story)
-        st.session_state.messages.append({"role": "assistant", "content": story})
-        
-        p.hp = max(0, min(100, p.hp - data.get("hp_cost", 0)))
-        p.mp = max(0, min(100, p.mp - data.get("mp_cost", 0)))
-        for k, v in data.get("grow_stats", {}).items(): p.grow_attribute(k, v)
-        p.advance_day(1)
-        game_data.save_game(p)
-        st.rerun()
+        try:
+            res = model.generate_content(order)
+            text_data = res.text
+            
+            # --- 安全装置エリア ---
+            try:
+                data = json.loads(text_data)
+            except:
+                # JSONとして読めなかった場合の保険
+                data = {"story": "（判定エラー：AIの返答が読み取れませんでした）", "grow_stats": {}, "hp_cost": 0, "mp_cost": 0}
+
+            # もしリスト（[]）で返ってきたら、中身の1つ目を取り出す
+            if isinstance(data, list):
+                if len(data) > 0:
+                    data = data[0]
+                else:
+                    data = {}
+            
+            # もし辞書型（{}）じゃなかったら強制的に空にする
+            if not isinstance(data, dict):
+                data = {"story": str(text_data), "grow_stats": {}, "hp_cost": 0, "mp_cost": 0}
+            # --------------------
+            
+            # データ更新
+            story = data.get("story", "描写なし")
+            st.markdown(story)
+            st.session_state.messages.append({"role": "assistant", "content": story})
+            
+            p.hp = max(0, min(100, p.hp - data.get("hp_cost", 0)))
+            p.mp = max(0, min(100, p.mp - data.get("mp_cost", 0)))
+            for k, v in data.get("grow_stats", {}).items(): 
+                p.grow_attribute(k, v)
+                
+            p.advance_day(1)
+            game_data.save_game(p)
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"通信エラー: {e}")
 
 # ■ 試合（マッチ）画面
 elif st.session_state.game_phase == "match":
