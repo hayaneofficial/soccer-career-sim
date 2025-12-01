@@ -194,12 +194,64 @@ def load_game(filename="save_data.json"):
     if not service:
         return None
         
-    folder_id = get_folder_id(service, "SoccerSimData")
-    
-    query = f"name = '{filename}'"
-    if folder_id:
-        query += f" and '{folder_id}' in parents"
+    # --- ここから下を書き換えてください ---
+
+# ★ここにコピーしたフォルダIDを貼り付けてください！
+FOLDER_ID = "1_IVb-lZUdM2B_n6yLQIjhCEA1HQhlbfH" 
+
+def get_drive_service():
+    """SecretsのJSONを使ってDrive APIに接続する"""
+    if "gcp_json" not in st.secrets:
+        return None
+    try:
+        creds_dict = json.loads(st.secrets["gcp_json"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        st.error(f"Drive接続エラー: {e}")
+        return None
+
+# フォルダを探す関数はもう不要なので削除してもいいですが、
+# 念のため残す場合は使わないようにします。
+
+# --- セーブ＆ロード関数 (ID指定・上書き専用版) ---
+
+def save_game(player, filename="save_data.json"):
+    """Google Driveの既存ファイルを上書き保存する"""
+    service = get_drive_service()
+    if not service:
+        st.error("Google Driveに接続できません。")
+        return
+
+    # 1. まずフォルダ内のファイルを探す
+    query = f"name = '{filename}' and '{FOLDER_ID}' in parents"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    files = results.get('files', [])
+
+    # データ作成
+    data_str = json.dumps(player.to_dict(), ensure_ascii=False, indent=4)
+    media = MediaIoBaseUpload(io.BytesIO(data_str.encode('utf-8')), mimetype='application/json')
+
+    if files:
+        # ★ある場合：上書き保存（これなら容量エラーが出ない！）
+        file_id = files[0]['id']
+        service.files().update(fileId=file_id, media_body=media).execute()
+        # st.success("クラウドに保存しました！") # 毎回出るとうるさいのでコメントアウト
+    else:
+        # ★ない場合：エラーを出す（ロボットは新規作成できないため）
+        st.error(f"Driveに '{filename}' が見つかりません。PCから手動でアップロードしてください。")
+
+def load_game(filename="save_data.json"):
+    """Google Driveから読み込む"""
+    service = get_drive_service()
+    if not service:
+        return None
         
+    # IDを使ってピンポイントで探す
+    query = f"name = '{filename}' and '{FOLDER_ID}' in parents"
     results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get('files', [])
     
