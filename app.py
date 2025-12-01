@@ -20,27 +20,27 @@ with st.sidebar:
     if st.session_state.game_phase == "main":
         p = st.session_state.player
         
+        # ★NEW: 資産・契約情報の表示エリア
+        st.divider()
+        st.subheader("💰 資産・契約")
+        st.write(f"**所持金: ¥{p.funds:,}**")
+        st.caption(f"年俸: ¥{p.salary:,} (月給: ¥{int(p.salary/12):,})")
+        st.caption(f"契約残り: {p.contract_years}年")
+
         st.divider()
         st.subheader("👥 チーム状況")
-        
-        # 序列の判定
         status, reason = p.get_squad_status()
-        st.info(f"現在の序列: **{status}**\n\n({reason})")
+        st.info(f"序列: **{status}**\n({reason})")
         
-        # 監督
         manager = p.get_npc_by_role("監督")
         if manager:
             trust_val = (manager.relation + 100) / 200
             st.progress(trust_val, text=f"監督信頼度: {manager.relation}")
         
-        # ライバル表示
         rival = p.get_npc_by_role("ライバル")
         if rival:
-            st.write(f"⚔️ **ライバル: {rival.name}**")
-            st.caption(f"CA: {rival.ca:.1f} ({rival.description})")
             diff = p.ca - rival.ca
-            if diff > 0: st.success(f"あなたの方が強い (+{diff:.1f})")
-            else: st.error(f"ライバルの方が強い ({diff:.1f})")
+            st.caption(f"VSライバル: {'優勢' if diff>0 else '劣勢'} ({diff:+.1f})")
 
         st.divider()
         if st.button("💾 セーブ"):
@@ -64,7 +64,7 @@ if st.session_state.game_phase == "start":
         st.session_state.game_phase = "create"
         st.rerun()
 
-# ■ キャラ作成 (ここに安全装置を追加しました！)
+# ■ キャラ作成
 elif st.session_state.game_phase == "create":
     st.title("📝 選手登録")
     if not api_key: st.stop()
@@ -83,58 +83,29 @@ elif st.session_state.game_phase == "create":
             model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
             
             prompt = f"""
-            以下に基づき初期データ生成。JSON出力。
             選手: {name}, {age}歳, {position}, 経歴: {style}
-            
-            指示:
-            1. 能力値(attributes)作成。
-            2. NPC「監督」作成（relation=0）。
-            3. NPC「ライバル」を一人作成。
-               - 同じポジション。
-               - 能力(ca)は、プレイヤーの初期CAより「やや高い」設定にすること（壁となる存在）。
-               - 性格は「エリート」「努力家」など。
-            
-            Format:
-            {{
-                "attributes": {{...}},
-                "manager": {{ "name": "...", "description": "..." }},
-                "rival": {{ "name": "...", "description": "...", "ca": 110.5 }},
-                "comment": "スカウトコメント"
-            }}
+            指示: 初期能力値、監督(relation=0)、ライバル(CA高め)を作成。JSON出力。
+            Format: {{ "attributes": {{...}}, "manager": {{ "name": "...", "description": "..." }}, "rival": {{ "name": "...", "description": "...", "ca": 110.5 }}, "comment": "..." }}
             """
             
             res = model.generate_content(prompt)
+            # 安全装置
+            try: data = json.loads(res.text)
+            except: data = {}
+            if isinstance(data, list): data = data[0] if data else {}
+            if not isinstance(data, dict): data = {}
             
-            # ★安全装置: 文字列をJSONにする
-            try:
-                data = json.loads(res.text)
-            except:
-                st.error("AIからのデータ読み取りに失敗しました。もう一度押してください。")
-                st.stop()
-
-            # ★安全装置: もしリスト形式で返ってきたら、中身を取り出す
-            if isinstance(data, list):
-                if len(data) > 0:
-                    data = data[0]
-                else:
-                    st.error("AIから空のデータが返ってきました。")
-                    st.stop()
-            
-            # プレイヤー
             p = game_data.Player(name, position, age, attributes=data.get("attributes"))
             
-            # 監督追加
-            mgr_data = data.get("manager", {"name": "監督", "description": "普通"})
-            p.add_npc(game_data.NPC(mgr_data.get("name", "監督"), "監督", 0, mgr_data.get("description", "")))
+            mgr = data.get("manager", {"name":"監督", "description":""})
+            p.add_npc(game_data.NPC(mgr.get("name"), "監督", 0, mgr.get("description")))
             
-            # ライバル追加
-            riv_data = data.get("rival", {"name": "ライバル", "description": "強敵", "ca": p.ca + 5})
-            rival_npc = game_data.NPC(riv_data.get("name", "ライバル"), "ライバル", 0, riv_data.get("description", ""), ca=riv_data.get("ca", p.ca + 5))
-            p.add_npc(rival_npc)
+            riv = data.get("rival", {"name":"ライバル", "description":"", "ca":p.ca+5})
+            p.add_npc(game_data.NPC(riv.get("name"), "ライバル", 0, riv.get("description"), ca=riv.get("ca")))
             
             st.session_state.player = p
             st.session_state.game_phase = "main"
-            st.session_state.messages = [{"role": "assistant", "content": f"【入団】\n{data.get('comment', '入団手続き完了')}\n\n同じポジションには、{rival_npc.name}（CA:{rival_npc.ca:.1f}）という絶対的なレギュラーがいます。\n彼からスタメンを奪うのが最初の目標です！"}]
+            st.session_state.messages = [{"role": "assistant", "content": f"【入団】\n{data.get('comment')}\n\n年俸 **480万円** で契約しました！\nプロ生活のスタートです。"}]
             st.rerun()
             
         except Exception as e:
@@ -145,86 +116,112 @@ elif st.session_state.game_phase == "main":
     p = st.session_state.player
     st.title(f"⚽ {p.name} の日常")
     
-    # 試合出場判定
-    status, reason = p.get_squad_status()
+    # ★NEW: タブ機能（行動とショップを分ける）
+    tab1, tab2 = st.tabs(["🏃 行動", "🛍️ ショップ"])
     
-    if "スタメン" in status and p.hp > 60:
-        if st.button("🏟️ 公式戦に出場する"):
-            ms = game_data.MatchState(p.name, p.position)
-            st.session_state.match_state = ms
-            pos_r, pos_c = ms.player_pos
-            st.session_state.game_phase = "match"
-            st.session_state.messages = [{"role": "assistant", "content": f"後半35分、スコア0-0。{pos_r}{pos_c}でボールを受けた！"}]
-            st.rerun()
-    elif p.hp <= 60:
-        st.warning("⚠️ 体力不足")
-    else:
-        st.error(f"🔒 試合に出られません（理由: {reason}）")
-    
-    # チャット
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]): st.markdown(m["content"])
+    with tab1:
+        # 試合出場判定
+        status, reason = p.get_squad_status()
+        if "スタメン" in status and p.hp > 60:
+            if st.button("🏟️ 公式戦に出場する"):
+                ms = game_data.MatchState(p.name, p.position)
+                st.session_state.match_state = ms
+                pos_r, pos_c = ms.player_pos
+                st.session_state.game_phase = "match"
+                st.session_state.messages = [{"role": "assistant", "content": f"後半35分、スコア0-0。{pos_r}{pos_c}でボールを受けた！"}]
+                st.rerun()
+        elif p.hp <= 60:
+            st.warning("⚠️ 体力不足")
+        else:
+            st.error(f"🔒 試合に出られません（理由: {reason}）")
+        
+        # チャット
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]): st.markdown(m["content"])
 
-    if prompt := st.chat_input("行動を入力"):
-        if not api_key: st.stop()
-        with st.chat_message("user"): st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        if prompt := st.chat_input("行動を入力"):
+            if not api_key: st.stop()
+            with st.chat_message("user"): st.markdown(prompt)
+            st.session_state.messages.append({"role": "user", "content": prompt})
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
-        
-        manager = p.get_npc_by_role("監督")
-        rival = p.get_npc_by_role("ライバル")
-        
-        mgr_info = f"{manager.name}(信頼:{manager.relation})" if manager else "なし"
-        riv_info = f"{rival.name}(CA:{rival.ca})" if rival else "なし"
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("models/gemini-2.0-flash", generation_config={"response_mime_type": "application/json"})
+            
+            manager = p.get_npc_by_role("監督")
+            rival = p.get_npc_by_role("ライバル")
+            mgr_info = f"{manager.name}(信頼:{manager.relation})" if manager else ""
+            riv_info = f"{rival.name}(CA:{rival.ca})" if rival else ""
 
-        order = f"""
-        日時:{p.current_date}, 選手:{p.name}, 行動:{prompt}
-        監督:{mgr_info}, ライバル:{riv_info}
-        
-        指示:
-        1. ユーザーの行動結果(story, grow_stats, hp/mp_cost, relation_change)を出力。
-        2. さらに「ライバルも独自に練習している」。ライバルの成長値(rival_growth_ca)を 0.0〜0.3 の間で決めて出力。
-        3. storyには、ライバルの様子（「〇〇も負けじと走り込んでいる」など）も含めて。
-        4. 必ず単一のJSONオブジェクトで出力（リスト禁止）。
-        
-        Format: {{ 
-            "story": "...", 
-            "grow_stats": {{...}}, "hp_cost": 10, "mp_cost": 0, "relation_change": 0,
-            "rival_growth_ca": 0.1
-        }}
-        """
-        
-        try:
-            res = model.generate_content(order)
+            order = f"""
+            日時:{p.current_date}, 選手:{p.name}, 行動:{prompt}
+            監督:{mgr_info}, ライバル:{riv_info}
+            指示: 行動結果(story, grow, hp/mp_cost, rel_change)と、ライバルの成長(rival_growth)を出力。リスト禁止。
+            Format: {{ "story": "...", "grow_stats": {{...}}, "hp_cost": 10, "mp_cost": 0, "relation_change": 0, "rival_growth_ca": 0.1 }}
+            """
             
-            # ★安全装置
-            try: data = json.loads(res.text)
-            except: data = {}
-            if isinstance(data, list): data = data[0] if data else {}
-            if not isinstance(data, dict): data = {}
-            
-            story = data.get("story", "描写なし")
-            st.markdown(story)
-            st.session_state.messages.append({"role": "assistant", "content": story})
-            
-            p.hp = max(0, min(100, p.hp - data.get("hp_cost", 0)))
-            p.mp = max(0, min(100, p.mp - data.get("mp_cost", 0)))
-            for k, v in data.get("grow_stats", {}).items(): p.grow_attribute(k, v)
-            if manager: manager.relation = max(-100, min(100, manager.relation + data.get("relation_change", 0)))
-            
-            if rival:
-                growth = data.get("rival_growth_ca", 0.05)
-                rival.ca += growth
-                st.toast(f"ライバルCA +{growth:.2f}")
+            try:
+                res = model.generate_content(order)
+                # 安全装置
+                try: data = json.loads(res.text)
+                except: data = {}
+                if isinstance(data, list): data = data[0] if data else {}
+                if not isinstance(data, dict): data = {}
+                
+                story = data.get("story", "...")
+                st.markdown(story)
+                st.session_state.messages.append({"role": "assistant", "content": story})
+                
+                p.hp = max(0, min(100, p.hp - data.get("hp_cost", 0)))
+                p.mp = max(0, min(100, p.mp - data.get("mp_cost", 0)))
+                for k, v in data.get("grow_stats", {}).items(): p.grow_attribute(k, v)
+                if manager: manager.relation = max(-100, min(100, manager.relation + data.get("relation_change", 0)))
+                if rival: rival.ca += data.get("rival_growth_ca", 0.05)
 
-            p.advance_day(1)
-            game_data.save_game(p)
-            st.rerun()
+                # ★NEW: 給料日チェック
+                pay_log = p.advance_day(1)
+                if pay_log:
+                    st.toast(pay_log, icon="💰")
+                    # チャットログにも残す
+                    st.session_state.messages.append({"role": "assistant", "content": f"**{pay_log}**"})
+
+                game_data.save_game(p)
+                st.rerun()
+            except Exception as e:
+                st.error(f"エラー: {e}")
+
+    # ★NEW: ショップタブの実装
+    with tab2:
+        st.subheader("🛍️ アイテムショップ")
+        st.write(f"所持金: **¥{p.funds:,}**")
+        st.info("お金を使ってコンディション回復や能力アップができます。")
+        
+        # 商品リスト
+        items = [
+            {"name": "高級プロテイン", "price": 5000, "effect": "HP+30", "hp": 30, "mp": 0},
+            {"name": "戦術分析書", "price": 10000, "effect": "MP+20 & Decisions微増", "hp": 0, "mp": 20, "stat": "Decisions"},
+            {"name": "温泉旅行", "price": 50000, "effect": "HP/MP全快", "hp": 100, "mp": 100},
+            {"name": "最新スパイク", "price": 100000, "effect": "Pace/Agility強化", "hp": 0, "mp": 10, "stat": "Pace"}
+        ]
+        
+        for item in items:
+            c_name, c_effect, c_btn = st.columns([2, 2, 1])
+            c_name.write(f"**{item['name']}** (¥{item['price']:,})")
+            c_effect.caption(item['effect'])
             
-        except Exception as e:
-            st.error(f"エラー: {e}")
+            if c_btn.button("購入", key=item['name']):
+                if p.funds >= item['price']:
+                    p.funds -= item['price']
+                    p.hp = min(100, p.hp + item['hp'])
+                    p.mp = min(100, p.mp + item['mp'])
+                    if "stat" in item:
+                        p.grow_attribute(item['stat'], 0.5) # 能力も少し上がる
+                        st.toast(f"{item['name']}を購入！能力UP！")
+                    else:
+                        st.toast(f"{item['name']}を購入！コンディション回復！")
+                    game_data.save_game(p)
+                    st.rerun()
+                else:
+                    st.error("お金が足りません！")
 
 # ■ 試合画面
 elif st.session_state.game_phase == "match":
@@ -255,8 +252,7 @@ elif st.session_state.game_phase == "match":
             Format: {{ "story": "...", "result": "success", "score_ally_add": 0, "new_position_row": 0, "new_position_col": "C", "is_match_end": false }}
             """
             res = model.generate_content(match_order)
-            
-            # ★ここにも安全装置
+            # 安全装置
             try: data = json.loads(res.text)
             except: data = {}
             if isinstance(data, list): data = data[0] if data else {}
@@ -289,6 +285,14 @@ elif st.session_state.game_phase == "match":
                     st.session_state.game_phase = "main"
                     p.hp = max(0, p.hp - 30)
                     p.advance_day(1)
+                    
+                    # ★NEW: 勝利ボーナス
+                    if m_state.score_ally > m_state.score_enemy:
+                        win_bonus = 100000
+                        p.funds += win_bonus
+                        st.toast(f"勝利ボーナス +¥{win_bonus:,} GET!", icon="💰")
+                        st.session_state.messages.append({"role": "assistant", "content": f"**勝利ボーナス ¥{win_bonus:,} を獲得しました！**"})
+                    
                     game_data.save_game(p)
                     st.rerun()
             else:
