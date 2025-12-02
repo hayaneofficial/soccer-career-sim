@@ -29,18 +29,7 @@ if "temp_profile" not in st.session_state:
 if "temp_data" not in st.session_state:
     st.session_state.temp_data = {}
 
-# --- 便利関数 ---
-def determine_category(team_name):
-    name = team_name.replace(" ", "").replace("　", "").upper()
-    if "高校" in name or "高等学校" in name or "HIGH" in name or "ACADEMY" in name:
-        return "HighSchool"
-    elif "大学" in name or "大學" in name or "UNIV" in name:
-        return "University"
-    elif "U-" in name or "U1" in name or "U2" in name or "YOUTH" in name or "ユース" in name:
-        return "Youth"
-    else:
-        return "Professional"
-# --- 便利関数 ---
+# --- 便利関数（UI） ---
 def render_stat(col, label, value, sub=None):
     """
     1行のメトリクスをコンパクトなカードで表示する。
@@ -72,12 +61,40 @@ def render_stat(col, label, value, sub=None):
         unsafe_allow_html=True
     )
 
-def determine_category(team_name):
-    name = team_name.replace(" ", "").replace("　", "").upper()
-    ...
+
+# --- カテゴリ判定 ---
+def determine_category(team_name: str) -> str:
+    """
+    チーム名からカテゴリを判定する共通関数。
+    HighSchool / University / Youth / Professional のどれかを返す。
+    """
+    if not team_name:
+        return "Professional"
+
+    name = team_name.replace(" ", "").replace("　", "")
+    name_low = name.lower()
+
+    # 高校
+    if ("高校" in name) or ("高等学校" in name) or ("highschool" in name_low) or ("high-school" in name_low):
+        return "HighSchool"
+
+    # 大学
+    if ("大学" in name) or ("大學" in name) or ("univ" in name_low) or ("university" in name_low) or ("college" in name_low):
+        return "University"
+
+    # ユース / U-18 等
+    if ("ユース" in name) or ("youth" in name_low):
+        return "Youth"
+    if re.search(r"\bu-?1[0-9]\b", name_low) or "u18" in name_low or "u17" in name_low or "u16" in name_low:
+        return "Youth"
+    if "u-18" in name_low or "u18" in name_low:
+        return "Youth"
+
+    # それ以外はプロ扱い
+    return "Professional"
 
 
-
+# --- 汎用ユーティリティ ---
 def safe_json_load(text):
     try:
         text = text.replace("```json", "").replace("```", "").strip()
@@ -213,7 +230,6 @@ def create_initial_data(profile_data, category, start_date):
     return call_gemini(prompt)
 
 
-
 def create_team_data(team_name, category, start_date):
     prompt = f"""
     チーム名「{team_name}」({start_date}時点)のデータを生成せよ。
@@ -243,30 +259,348 @@ def create_team_data(team_name, category, start_date):
     """
     return call_gemini(prompt)
 
+def create_school_timetable(player):
+    """
+    高校/ユースの「学校時間割」を作成する。
+    チーム週間スケジュールと矛盾しないように、授業は基本的に日中、部活は放課後という前提。
+    """
+    team_plan = getattr(player, "team_weekly_plan", [])
+
+    prompt = f"""
+    あなたは日本の高校サッカー部員（または高校年代ユース選手）の
+    「学校の時間割」を設計するAIです。
+
+    [前提]
+    - 氏名: {player.name}
+    - 年齢: {player.age}
+    - チーム: {player.team_name}
+    - チームカテゴリ: {player.team_category}
+    - サッカーの週間スケジュール(概略):
+      {json.dumps(team_plan, ensure_ascii=False)}
+
+    [制約・方針]
+    - 日本の一般的な高校の時間割をベースにすること。
+      - 平日は Mon〜Fri を必須、必要なら Sat に午前授業を入れてよい。
+      - 1日あたりおおよそ 5〜6コマ（p1〜p6）を想定。
+    - サッカー部のトレーニングは「放課後」に行われる前提とし、
+      この時間割の p1〜p6 の中には原則サッカー部の活動を含めないこと。
+    - サッカーの週間スケジュールと大きく矛盾しないように、
+      例: トレーニングが非常にハードな日の翌日は、授業のコマ数をやや抑える など、
+      最低限の整合性は意識してください（ただし細かい時刻までは考えなくてよい）。
+
+    [出力形式]
+    次の形式の JSON のみを出力してください:
+
+    {{
+      "timetable": [
+        {{
+          "weekday": "Mon",
+          "p1": "現代文",
+          "p2": "数学I",
+          "p3": "英語コミュニケーション",
+          "p4": "世界史",
+          "p5": "体育",
+          "p6": "HR"
+        }}
+      ]
+    }}
+
+    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
+    - 少なくとも Mon〜Fri の5日分を含めること。
+    - JSON 以外のテキストは出力してはいけません。
+    """
+
+    res = call_gemini(prompt)
+    if not res:
+        # フォールバック（かなり単純なデフォルト）
+        default = [
+            {"weekday": "Mon", "p1": "現代文", "p2": "数学I", "p3": "英語", "p4": "世界史", "p5": "体育", "p6": "HR"},
+            {"weekday": "Tue", "p1": "数学I", "p2": "英語", "p3": "化学基礎", "p4": "古典", "p5": "地理", "p6": "LHR"},
+            {"weekday": "Wed", "p1": "英語", "p2": "物理基礎", "p3": "現代社会", "p4": "数学A", "p5": "体育", "p6": "HR"},
+            {"weekday": "Thu", "p1": "古典", "p2": "数学I", "p3": "英語", "p4": "生物基礎", "p5": "国語総合", "p6": "HR"},
+            {"weekday": "Fri", "p1": "世界史", "p2": "数学A", "p3": "英語", "p4": "情報", "p5": "体育", "p6": "HR"},
+        ]
+        return {"timetable": default}
+
+    if "timetable" not in res:
+        res["timetable"] = []
+    return res
+
+
+def create_univ_timetable(player):
+    """
+    大学生用の「履修時間割」を作成する。
+    チーム週間スケジュールと矛盾しないように、トレーニング時間帯を避けて講義を配置させる。
+    """
+    team_plan = getattr(player, "team_weekly_plan", [])
+
+    prompt = f"""
+    あなたは日本の大学サッカー部員の履修相談に乗るAIです。
+
+    [前提]
+    - 氏名: {player.name}
+    - 年齢: {player.age}
+    - 所属チーム: {player.team_name}
+    - チームカテゴリ: {player.team_category}
+    - サッカーの週間スケジュール(概略):
+      {json.dumps(team_plan, ensure_ascii=False)}
+
+    [前提（抽象）]
+    - 一般的な日本の大学を想定してよい（例: 1限 9:00〜、2限 10:40〜... 程度）。
+    - サッカーのトレーニングは主に「夕方〜夜」に行われる想定で、
+      heavy な講義はその時間帯には入れないように配慮すること。
+
+    [タスク]
+    - Mon〜Fri を中心に、「1週間の履修時間割」を作成してください。
+    - 各曜日について、p1〜p5 までの5コマを定義し、
+      それぞれに講義名または「空きコマ」「自習」などを設定してください。
+    - サッカーのトレーニングが「午後〜夕方」に集中している曜日は、
+      p4, p5 を空きコマにする など、最低限の両立を意識してください。
+    - 履修科目名は、それっぽい日本語の講義名で構いません
+      （例: 「経済学入門」「スポーツ科学基礎」「統計学Ⅰ」など）。
+
+    [出力形式]
+    次の形式の JSON のみを出力してください:
+
+    {{
+      "timetable": [
+        {{
+          "weekday": "Mon",
+          "p1": "経済学入門",
+          "p2": "統計学Ⅰ",
+          "p3": "空きコマ",
+          "p4": "スポーツ科学基礎",
+          "p5": "空きコマ"
+        }}
+      ]
+    }}
+
+    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
+    - 少なくとも Mon〜Fri の5日分を含めること。
+    - JSON 以外のテキストは出力してはいけません。
+    """
+
+    res = call_gemini(prompt)
+    if not res:
+        default = [
+            {"weekday": "Mon", "p1": "基礎ゼミ", "p2": "統計学Ⅰ", "p3": "空きコマ", "p4": "スポーツ科学入門", "p5": "空きコマ"},
+            {"weekday": "Tue", "p1": "経済学入門", "p2": "英語リーディング", "p3": "空きコマ", "p4": "情報リテラシー", "p5": "空きコマ"},
+            {"weekday": "Wed", "p1": "社会学概論", "p2": "空きコマ", "p3": "第二外国語", "p4": "空きコマ", "p5": "空きコマ"},
+            {"weekday": "Thu", "p1": "憲法学", "p2": "空きコマ", "p3": "スポーツ心理学", "p4": "空きコマ", "p5": "空きコマ"},
+            {"weekday": "Fri", "p1": "空きコマ", "p2": "空きコマ", "p3": "プロジェクト科目", "p4": "空きコマ", "p5": "空きコマ"},
+        ]
+        return {"timetable": default}
+
+    if "timetable" not in res:
+        res["timetable"] = []
+    return res
+
+
+def create_team_weekly_plan(team_name, category):
+    """
+    チームの「曜日ごとの基本スケジュール」を Gemini に作らせる。
+    例：月: OFF / 火: 午前ジム・午後TR など。
+    """
+    prompt = f"""
+    あなたはサッカーコーチ兼スケジューラーAIです。
+
+    [前提]
+    - チーム名: {team_name}
+    - カテゴリ: {category}
+
+    [タスク]
+    このチームの「1週間の基本スケジュール」を作成してください。
+    - 対象: 月曜〜日曜
+    - 各曜日について、
+      - morning: 午前の活動（例: OFF, フィジカル, ミーティング, コンディショニング など）
+      - afternoon: 午後の活動（例: チームトレーニング, 戦術トレーニング など）
+      - evening: 夜の活動（例: 自由, 映像分析, 寮での自習 など）
+      を日本語テキストで1〜2フレーズ程度記述してください。
+
+    カテゴリ別のイメージ:
+    - Professional: 週1〜2日OFF、他の日はトレーニング中心。試合前日は軽め。
+    - University / HighSchool / Youth:
+      学校の授業がある前提で、放課後にトレーニングが入る構成を意識してください。
+
+    [出力形式]
+    次の形式の JSON のみを出力してください:
+
+    {{
+      "plan": [
+        {{
+          "weekday": "Mon",
+          "morning": "OFF",
+          "afternoon": "チームトレーニング（戦術＋ポゼッション）",
+          "evening": "自由 / 映像分析"
+        }}
+      ]
+    }}
+
+    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
+    - 必ず 7 行（7曜日分）を含めてください。
+    - JSON 以外のテキストは出力してはいけません。
+    """
+
+    res = call_gemini(prompt)
+    if not res:
+        # フォールバック：ごく単純なデフォルト
+        default_plan = [
+            {"weekday": "Mon", "morning": "OFF", "afternoon": "チームトレーニング", "evening": "自由"},
+            {"weekday": "Tue", "morning": "ジム", "afternoon": "チームトレーニング", "evening": "自由"},
+            {"weekday": "Wed", "morning": "OFF", "afternoon": "戦術トレーニング", "evening": "映像分析"},
+            {"weekday": "Thu", "morning": "ジム", "afternoon": "チームトレーニング", "evening": "自由"},
+            {"weekday": "Fri", "morning": "軽めの調整", "afternoon": "セットプレー確認", "evening": "自由"},
+            {"weekday": "Sat", "morning": "試合 or 試合前日TR", "afternoon": "試合 or リカバリー", "evening": "自由"},
+            {"weekday": "Sun", "morning": "OFF", "afternoon": "OFF", "evening": "OFF"},
+        ]
+        return {"plan": default_plan}
+
+    if "plan" not in res:
+        # 形式がおかしいときの最低限の保険
+        res["plan"] = []
+    return res
+
 
 def create_schedule_data(team_name, category, year):
-    prompt = f"""
-    チーム「{team_name}」({year}年)の年間スケジュールを作成せよ。
-    リーグ戦を中心に30試合以上。
-    Output JSON:
-    {{
-        "schedule": [
-            {{ "date": "yyyy-mm-dd", "opponent": "...", "home": true }}
-        ]
-    }}
     """
-    return call_gemini(prompt)
+    チーム名・カテゴリ・年から、現実に近い大会構造と年間スケジュールを Gemini に推定させる。
+    - competitions: 大会メタ情報
+    - schedule: 1年分の試合リスト
+    """
+    prompt = f"""
+    あなたは世界中のサッカー大会構造に詳しいデータアナリストAIです。
+
+    [前提]
+    - チーム名: {team_name}
+    - カテゴリ: {category}
+    - シーズン: {year}年
+
+    [タスク概要]
+    1. 可能な範囲で一般的な知識を使い、
+       このチームが {year} シーズンに参加する可能性が高い大会を列挙してください。
+       - プロクラブの場合:
+         - 国内リーグ (必須)
+         - 国内カップ (原則含める)
+         - 欧州クラブであれば、チャンピオンズリーグ(CL) / ヨーロッパリーグ(EL) /
+           カンファレンスリーグ(ECL)の出場可能性も検討すること。
+       - 高校・大学・ユースの場合:
+         - 地域リーグ（例: 関東リーグ）
+         - インディペンデンスリーグ
+         - 全国大会・カップ戦　などを推定すること。
+
+    2. 各大会について、次のメタ情報を推定してください:
+       - code: "LEAGUE", "CUP", "CL", "EL", "ECL", "REGIONAL", "SCHOOL_CUP" など短い識別子
+       - name: 大会正式名称
+       - type: "league" または "knockout"
+       - priority: 数値 (1=最重要。通常はリーグ > カップ のように設定)
+       - season_start: "{year}-MM-DD" 形式の大会期間開始日（だいたいでよい）
+       - season_end:   "{year}-MM-DD" 形式の大会期間終了日（だいたいでよい）
+       - match_days: 代表的な試合曜日の配列 (例: ["Sat","Sun","Wed"])
+       - team_count: おおよそのチーム数
+       - rounds: リーグの場合は総当たり回数(1 or 2)、
+                 カップの場合はそのチームが最大で到達しうるラウンド数
+       - include_for_player: true/false
+         このゲーム内で扱うべき大会かどうか。マイナー大会は false でもよい。
+
+    3. 上記メタ情報にもとづいて、{year}年のこのチームの年間試合日程を作成してください。
+       制約:
+       - "schedule" には、少なくとも 30 試合以上を含めること。
+       - 国内リーグは現実に近い試合数になるようにすること。
+         - 18〜22チームのホーム&アウェーなら 34〜42 試合が目安。
+       - 国内カップは 1〜6 試合程度でよい（このチームの格に応じて推定してよい）。
+       - 欧州コンペティションは、現実の出場状況を知らない場合でも、
+         出場の可能性が相応にある強豪クラブなら数試合を想定して良い。
+       - 試合間隔はできるだけ 3 日以上あけること。
+       - 明らかなオフシーズン（リーグ終了後〜年末など）は試合を入れない。
+       - "date" は "{year}-01-01"〜"{year}-12-31" の範囲に収めること。
+
+    [出力形式]
+    100% 有効な JSON だけを出力してください。
+    次のスキーマに厳密に従ってください:
+
+    {{
+      "competitions": [
+        {{
+          "code": "LEAGUE",
+          "name": "J1リーグ",
+          "type": "league",
+          "priority": 1,
+          "season_start": "{year}-02-20",
+          "season_end":   "{year}-12-05",
+          "match_days": ["Sat","Sun"],
+          "team_count": 18,
+          "rounds": 2,
+          "include_for_player": true
+        }}
+      ],
+      "schedule": [
+        {{
+          "date": "{year}-02-25",
+          "opponent": "横浜F・マリノス",
+          "home": true,
+          "competition_code": "LEAGUE",
+          "round": "MD1"
+        }}
+      ]
+    }}
+
+    注意:
+    - 上記は例です。実際には {team_name} に合わせた大会・対戦相手・日程を生成してください。
+    - JSON 以外のテキスト（説明文やコメント）は一切出力してはいけません。
+    """
+
+    res = call_gemini(prompt)
+
+    # Gemini から何も返ってこなかったときのフォールバック（日程だけダミー生成）
+    if not res:
+        dummy_schedule = []
+        start = datetime.date(year, 3, 1)
+        for i in range(30):
+            d = start + datetime.timedelta(days=7 * i)
+            dummy_schedule.append({
+                "date": d.isoformat(),
+                "opponent": f"クラブ{i+1}",
+                "home": (i % 2 == 0),
+                "competition_code": "LEAGUE",
+                "round": f"MD{i+1}"
+            })
+        return {"competitions": [], "schedule": dummy_schedule}
+
+    # competitions / schedule が無い場合の保険
+    if "competitions" not in res:
+        res["competitions"] = []
+    if "schedule" not in res:
+        res["schedule"] = []
+
+    return res
+
 
 
 def generate_story(player, topic):
     prompt = f"""
-    選手: {player.name}, 所属:{player.team_name}
-    状況: {topic}
-    指示: 短い物語を作成。
+    あなたはリアル志向のサッカー小説家です。
 
-    Output JSON:
+    【選手設定】
+    - 名前: {player.name}
+    - 所属クラブ / チーム: {player.team_name}
+    - 年齢: {player.age}
+    - ポジション: {player.position}
+    - 現在の日付: {player.current_date}
+
+    【シーン】
+    - 状況: {topic}
+
+    【執筆方針】
+    - 一人称視点（「僕」）で書くこと。
+    - 地の文と会話文をバランスよく混ぜること。
+    - 感情・身体感覚・周囲の空気感を具体的に描写すること
+      （例: 汗の匂い、スタンドのざわめき、スパイクの音、視線の重さなど）。
+    - ご都合主義ではなく、等身大のリアリティのあるトーン。
+    - 分量の目安は 400〜800字程度。
+
+    Output JSON ONLY:
     {{
-        "story": "..."
+        "story": "ここに日本語テキストを入れる。改行は \\n を使う。"
     }}
     """
     res = call_gemini(prompt)
@@ -275,7 +609,7 @@ def generate_story(player, topic):
 
 def generate_next_event(player):
     sorted_npcs = sorted(player.npcs, key=lambda x: abs(float(x.relation)), reverse=True)[:5]
-    npcs_txt = ", ".join([f"{n.role}:{n.name}({n.relation})" for n in sorted_npcs])
+    npcs_txt = ", ".join([f"{n.role}:{n.name}({n.relation})" for n in sorted_npcs]) or "重要な人間関係はまだ少ない"
 
     next_match = None
     if player.schedule:
@@ -284,22 +618,50 @@ def generate_next_event(player):
             if m.get('date', '9999') >= str(player.current_date):
                 next_match = m
                 break
-    schedule_info = f"次戦: {next_match.get('date')} vs {next_match.get('opponent','未定')}" if next_match else "予定なし"
+    schedule_info = (
+        f"次戦: {next_match.get('date')} vs {next_match.get('opponent','未定')}"
+        if next_match else "次戦予定なし"
+    )
 
     prompt = f"""
-    選手: {player.name}, 所属:{player.team_name}
-    現在日時: {player.current_date}
-    スケジュール: {schedule_info}
-    人間関係: {npcs_txt}
+    あなたはリアル志向のサッカー小説家兼ゲームマスターです。
 
-    指示:
-    - 次に起こるイベントを作成する。
-    - 選択肢は必ず3つ用意する。
+    【プレイヤー情報】
+    - 名前: {player.name}
+    - 所属: {player.team_name}
+    - カテゴリ: {player.team_category}
+    - ポジション: {player.position}
+    - 年齢: {player.age}
+    - 現在日付: {player.current_date}
+    - 現在CA: {player.ca:.2f}, PA: {player.pa:.2f}
+    - HP: {player.hp}, MP: {player.mp}
 
-    Output JSON:
+    【文脈】
+    - 直近スケジュール情報: {schedule_info}
+    - 関係性が強い/こじれているNPC一覧: {npcs_txt}
+
+    【タスク】
+    - 「今このタイミングで起こりうる、等身大のイベント」を1つ作りなさい。
+      - 例: 練習後のロッカーでの会話 / 寮での夜の独り時間 / 恋人とのすれ違い /
+            監督との面談 / 次戦メンバー発表 など。
+      - サッカー要素と生活要素が両方少しずつ絡むのが理想。
+
+    【表現ルール】
+    - title: 20文字以内の短いイベント名。
+    - description: 400〜900字程度の本文。
+      - 一人称の地の文＋会話文。
+      - 感情・身体感覚・空気感を丁寧に描写。
+      - 直近の試合・序列・練習への不安や期待なども自然に織り込んでよい。
+
+    【選択肢】
+    - choices は必ず3つ。
+    - text: プレイヤーが即座に選べる行動（短文）。
+    - hint: その行動がプレイヤーのキャリアに与えそうな影響のニュアンスを一言で。
+
+    Output JSON ONLY:
     {{
-      "title": "...",
-      "description": "...",
+      "title": "短いイベント名",
+      "description": "本文テキスト。改行は \\n を使う。",
       "choices": [
         {{"text":"...", "hint":"..." }},
         {{"text":"...", "hint":"..." }},
@@ -309,35 +671,67 @@ def generate_next_event(player):
     """
     res = call_gemini(prompt)
     if not res:
-        return {"title": "日常", "description": "特になし", "choices": [{"text": "自主練", "hint": ""}]}
+        return {
+            "title": "静かな一日",
+            "description": "今日は大きな出来事はなかった。\\n\\n寮の部屋で一人、次の練習と試合のことを考えながらストレッチをしている。",
+            "choices": [{"text": "軽く自主練に出る", "hint": "わずかに成長"}]
+        }
     return res
 
 
 def resolve_action(player, choice_text, event_desc):
     prompt = f"""
-    状況: {event_desc}
-    選択: {choice_text}
-    選手: {player.name}
-    能力: {player.attributes}
+    あなたはリアル志向のサッカーコーチ兼ストーリーテラーです。
 
-    あなたはフットボールコーチAIです。
-    その日のサッカー活動強度(Base)と、体感採点に対応するPerformanceも決めてください。
+    【前提状況】
+    - イベント本文: {event_desc}
+    - プレイヤーの選択: {choice_text}
 
-    - Base: TRや試合、自主練の合計。だいたい 0.01〜0.30 の範囲。
-    - Performance: 0.6〜1.5（標準は0.8〜1.0）
+    【選手情報】
+    - 名前: {player.name}
+    - 所属: {player.team_name}
+    - カテゴリ: {player.team_category}
+    - ポジション: {player.position}
+    - 年齢: {player.age}
+    - 現在日付: {player.current_date}
+    - 現在CA: {player.ca:.2f}, PA: {player.pa:.2f}
+    - HP: {player.hp}, MP: {player.mp}
 
-    Format (必ずこのキーを含めてJSONで出力):
+    【タスク】
+    1. この選択をした結果、その日の出来事がどう展開したかを
+       一人称視点で 400〜800字程度のストーリー(result_story)にまとめること。
+       - 練習・試合内容、周囲の反応、自分の感情や身体感覚、
+         帰り道や夜のベッドの中での反芻までを描いてよい。
+       - 「成功した／失敗した」だけでなく、モヤモヤや学びも描写すること。
+
+    2. その日のサッカー活動強度(Base)と、体感採点に対応するPerformanceを決めること。
+       - Base: TRや試合、自主練の合計。だいたい 0.01〜0.30 の範囲。
+       - Performance: 0.6〜1.5（標準は0.8〜1.0）
+
+    3. 成長させるべき能力(grow_stats)を2〜6個程度選び、
+       それぞれ 0.01〜0.30 程度の微小な成長値を割り当てること。
+       - 行動内容に整合的な能力のみを上げること
+         （例: ハードなフィジカルトレ → Stamina, Strength など）。
+       - JSONのキーは game_data.WEIGHTS にある能力名と一致させること。
+
+    4. 必要に応じて人間関係relation_changeも1件だけ指定してよい。
+       - role: 関係性のラベル（例: "監督", "チームメイト", "恋人" など）
+       - val: -10〜+10の整数。
+
+    【出力フォーマット】
+    以下のJSONだけを出力してください:
+
     {{
-      "result_story": "...",
+      "result_story": "本文。改行は \\n を使う。",
       "grow_stats": {{
-         "Decisions": 0.1,
-         "Acceleration": 0.2
+         "Decisions": 0.05,
+         "Acceleration": 0.10
       }},
       "hp_cost": 10,
       "mp_cost": 5,
       "relation_change": {{
-         "role": "...",
-         "val": 5
+         "role": "監督",
+         "val": 3
       }},
       "base": 0.12,
       "performance": 0.9
@@ -427,7 +821,6 @@ elif st.session_state.game_phase == "review_stats":
 
     data = st.session_state.temp_data["stats"]
 
-    # 🔽 ここから修正
     # Gemini が返した attributes に、FM準拠の全キーをマージして 10.0 で初期化する
     raw_attr = data.get("attributes", {}) or {}
     base_attrs = {k: 10.0 for k in game_data.WEIGHTS.keys()}
@@ -435,7 +828,7 @@ elif st.session_state.game_phase == "review_stats":
         if k in raw_attr and raw_attr[k] is not None:
             base_attrs[k] = float(raw_attr[k])
 
-    # CAプレビューも出しておくと便利
+    # CAプレビュー
     total_score = sum(base_attrs[key] * game_data.WEIGHTS[key] for key in game_data.WEIGHTS.keys())
     ca_preview = (total_score / game_data.THEORETICAL_MAX_SCORE) * 200
 
@@ -447,7 +840,6 @@ elif st.session_state.game_phase == "review_stats":
             pd.DataFrame([base_attrs]),
             use_container_width=True
         )
-    # 🔼 ここまで修正
 
     with c2:
         st.write("人間関係")
@@ -493,24 +885,115 @@ elif st.session_state.game_phase == "review_stats":
             )
 
         st.session_state.player = p
+
+        # カテゴリに応じて次フェーズを分岐
+        cat_raw = p.team_category or ""
+        cat_norm = cat_raw.lower()
+
+        if ("professional" in cat_norm) or ("pro" in cat_norm):
+            st.session_state.game_phase = "agent_choice"
+        elif "youth" in cat_norm:
+            st.session_state.game_phase = "agent_choice"
+        elif ("highschool" in cat_norm) or ("高校" in cat_raw):
+            st.session_state.game_phase = "team_intro"
+        elif ("university" in cat_norm) or ("大学" in cat_raw):
+            st.session_state.game_phase = "team_intro"
+        else:
+            st.session_state.game_phase = "team_intro"
+
+        st.rerun()
+
+# --- 2.5 代理人選択 ---
+elif st.session_state.game_phase == "agent_choice":
+    p = st.session_state.player
+    st.title("🤝 代理人の選択")
+
+    st.write(
+        "これからのキャリアを考えて、代理人（エージェント）を付けるかどうかを決めます。"
+        "ここでは物語とニュアンスだけに影響し、まだ契約条件ロジックには直結させません。"
+    )
+
+    default_index = 2 if p.team_category == "Professional" else 1
+    option = st.radio(
+        "あなたの現在の状況に一番近いものを選んでください。",
+        ["付けない", "身近な人が兼ねる（家族・先輩など）", "専任のエージェントが付いている"],
+        index=default_index
+    )
+
+    if st.button("決定して次へ"):
+        # とりあえずプレイヤーオブジェクトにぶら下げる（セーブは後で考える）
+        p.agent_type = option
+
+        if p.team_category == "Professional":
+            st.session_state.game_phase = "pro_contract"
+        else:
+            # ユースはすぐに入団会見へ
+            st.session_state.game_phase = "story_intro"
+
+        st.rerun()
+
+# --- 2.6 プロ限定：契約交渉 ---
+elif st.session_state.game_phase == "pro_contract":
+    p = st.session_state.player
+    st.title("📝 契約交渉")
+
+    if "pro_contract_story" not in st.session_state:
+        with st.spinner("契約交渉のシーンを生成中..."):
+            st.session_state.pro_contract_story = generate_story(
+                p,
+                "代理人（または自分）とクラブが年俸や契約年数について詰めている契約交渉のシーン"
+            )
+
+    st.markdown(st.session_state.pro_contract_story)
+
+    # いまは条件いじらず、演出だけ
+    if st.button("契約にサインする"):
+        del st.session_state.pro_contract_story
         st.session_state.game_phase = "story_intro"
         st.rerun()
 
-# --- 3. Story Intro ---
+# --- 3. Story Intro（プロ・ユースの入団会見） ---
 elif st.session_state.game_phase == "story_intro":
     p = st.session_state.player
     st.title("🎬 入団")
 
     if "intro_text" not in st.session_state:
         with st.spinner("物語を生成中..."):
-            topic = "入団会見" if p.team_category == "Professional" else "部室での自己紹介"
+            if p.team_category in ["Professional", "Youth"]:
+                topic = "入団会見とメディア向けフォトセッション"
+            else:
+                topic = "部室での自己紹介"
             st.session_state.intro_text = generate_story(p, topic)
 
     st.markdown(st.session_state.intro_text)
 
     if st.button("チームメイトと対面する"):
-        st.session_state.game_phase = "review_team"
+        # プロ/ユースはここからチーム内自己紹介へ
+        st.session_state.game_phase = "team_intro"
         del st.session_state.intro_text
+        st.rerun()
+
+# --- 3.5 チーム内自己紹介（全カテゴリ共通） ---
+elif st.session_state.game_phase == "team_intro":
+    p = st.session_state.player
+    st.title("👥 チーム内自己紹介")
+
+    if "intro_text" not in st.session_state:
+        with st.spinner("自己紹介シーンを生成中..."):
+            if p.team_category in ["University", "HighSchool"]:
+                topic = "部室での自己紹介と、先輩・同級生との最初の会話"
+            elif p.team_category in ["Professional", "Youth"]:
+                topic = "ロッカールームでの自己紹介と、チームメイトとの最初のやり取り"
+            else:
+                topic = "チームメイトへの自己紹介"
+
+            st.session_state.intro_text = generate_story(p, topic)
+
+    st.markdown(st.session_state.intro_text)
+
+    if st.button("チームメイト一覧を確認する"):
+        del st.session_state.intro_text
+        st.session_state.game_phase = "review_team"
         st.rerun()
 
 # --- 4. Review Team ---
@@ -520,6 +1003,9 @@ elif st.session_state.game_phase == "review_team":
 
     if not p.team_members:
         with st.spinner("チームデータを生成中..."):
+            # 念のためここで再度カテゴリをチーム名から強制判定
+            p.team_category = determine_category(p.team_name)
+
             res = create_team_data(p.team_name, p.team_category, p.current_date)
             if res:
                 p.formation = res.get("formation", "4-4-2")
@@ -574,8 +1060,6 @@ elif st.session_state.game_phase == "review_team":
         st.session_state.game_phase = "story_hierarchy"
         st.rerun()
 
-
-
 # --- 5. Story Hierarchy ---
 elif st.session_state.game_phase == "story_hierarchy":
     p = st.session_state.player
@@ -590,9 +1074,114 @@ elif st.session_state.game_phase == "story_hierarchy":
         mark = "👈 YOU" if m.name == p.name else ""
         st.write(f"{m.hierarchy} | {m.name} (CA:{m.ca:.1f}) {mark}")
 
-    if st.button("日程を確認する"):
+    # ★変更：まずはチームの週間スケジュールを見に行く
+    if st.button("チームの週間スケジュールを見る"):
+        st.session_state.game_phase = "team_weekly_plan"
+        st.rerun()
+# --- 5.5 Team Weekly Plan ---
+elif st.session_state.game_phase == "team_weekly_plan":
+    p = st.session_state.player
+    st.title("🗓 チームの週間スケジュール")
+
+    # まだ作っていなければ Gemini で生成
+    if not getattr(p, "team_weekly_plan", None):
+        with st.spinner("チームの週間スケジュールを作成中..."):
+            res = create_team_weekly_plan(p.team_name, p.team_category)
+            if res:
+                p.team_weekly_plan = res.get("plan", [])
+                game_data.save_game(p)
+
+    st.info("コーチ陣が決めたベースの週間スケジュールです。必要なら編集してください。")
+
+    if p.team_weekly_plan:
+        df_plan = pd.DataFrame(p.team_weekly_plan)
+    else:
+        df_plan = pd.DataFrame(columns=["weekday", "morning", "afternoon", "evening"])
+
+    edited_plan = st.data_editor(
+        df_plan,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    if st.button("確定して次へ"):
+        p.team_weekly_plan = edited_plan.to_dict(orient="records")
+        game_data.save_game(p)
+
+        # ★カテゴリ・年齢に応じて遷移先を分岐
+        if p.team_category == "University":
+            st.session_state.game_phase = "univ_timetable"
+        elif p.team_category in ["HighSchool", "Youth"] and p.age <= 18:
+            st.session_state.game_phase = "school_timetable"
+        else:
+            # 社会人・プロなどはそのまま年間日程へ
+            st.session_state.game_phase = "review_schedule"
+
+        st.rerun()
+
+# --- 5.6 School Timetable (HighSchool / Youth <=18) ---
+elif st.session_state.game_phase == "school_timetable":
+    p = st.session_state.player
+    st.title("🏫 学校の時間割")
+
+    if not getattr(p, "school_timetable", None):
+        with st.spinner("学校の時間割を作成中..."):
+            res = create_school_timetable(p)
+            if res:
+                p.school_timetable = res.get("timetable", [])
+                game_data.save_game(p)
+
+    st.info("担任や進路指導の先生と相談して決めた、あなたの学校の時間割です。必要なら少し編集してください。")
+
+    if p.school_timetable:
+        df_tt = pd.DataFrame(p.school_timetable)
+    else:
+        df_tt = pd.DataFrame(columns=["weekday", "p1", "p2", "p3", "p4", "p5", "p6"])
+
+    edited_tt = st.data_editor(
+        df_tt,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    if st.button("確定して年間日程へ進む"):
+        p.school_timetable = edited_tt.to_dict(orient="records")
+        game_data.save_game(p)
         st.session_state.game_phase = "review_schedule"
         st.rerun()
+
+# --- 5.7 Univ Timetable (履修登録) ---
+elif st.session_state.game_phase == "univ_timetable":
+    p = st.session_state.player
+    st.title("🎓 履修登録（時間割）")
+
+    if not getattr(p, "school_timetable", None):
+        with st.spinner("履修時間割を作成中..."):
+            res = create_univ_timetable(p)
+            if res:
+                # 大学でも school_timetable にまとめて持たせる
+                p.school_timetable = res.get("timetable", [])
+                game_data.save_game(p)
+
+    st.info("サッカー部の予定と両立できるように、AIが提案した履修時間割です。必要に応じて講義名や空きコマを編集してください。")
+
+    if p.school_timetable:
+        df_tt = pd.DataFrame(p.school_timetable)
+    else:
+        df_tt = pd.DataFrame(columns=["weekday", "p1", "p2", "p3", "p4", "p5"])
+
+    edited_tt = st.data_editor(
+        df_tt,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    if st.button("確定して年間日程へ進む"):
+        p.school_timetable = edited_tt.to_dict(orient="records")
+        game_data.save_game(p)
+        st.session_state.game_phase = "review_schedule"
+        st.rerun()
+
 
 # --- 6. Review Schedule ---
 elif st.session_state.game_phase == "review_schedule":
@@ -603,6 +1192,10 @@ elif st.session_state.game_phase == "review_schedule":
         with st.spinner("リーグ日程を編成中..."):
             res = create_schedule_data(p.team_name, p.team_category, p.current_date.year)
             if res:
+                # 大会メタ情報（今はまだ画面には出さないが、今後の順位表などで使う）
+                if hasattr(p, "competitions"):
+                    p.competitions = res.get("competitions", [])
+                # 実際に使う年間日程
                 p.schedule = res.get("schedule", [])
                 game_data.save_game(p)
 
@@ -617,6 +1210,7 @@ elif st.session_state.game_phase == "review_schedule":
         game_data.save_game(p)
         st.session_state.game_phase = "story_schedule"
         st.rerun()
+
 
 # --- 7. Story Schedule ---
 elif st.session_state.game_phase == "story_schedule":
@@ -668,7 +1262,6 @@ elif st.session_state.game_phase == "main":
         tab_attr, tab_roster, tab_year, tab_week, tab_timetable, tab_rel, tab_shop, tab_transfer = st.tabs(
             ["📊 能力/適性", "👥 名簿", "📅 年間日程", "🗓 週間日程", "⏰ 時間割", "🤝 人間関係", "🛍️ ショップ", "📩 移籍"]
         )
-
 
         # ========== タブ: 能力 / ポジション適性 ==========
         with tab_attr:
@@ -747,7 +1340,7 @@ elif st.session_state.game_phase == "main":
             else:
                 st.info("年間日程がまだ編成されていません。")
 
-        # ========== タブ: 週間日程（現在日付から7日分のざっくりビュー） ==========
+        # ========== タブ: 週間日程（現在日付から7日分） ==========
         with tab_week:
             from datetime import timedelta
 
@@ -869,12 +1462,24 @@ elif st.session_state.game_phase == "main":
             st.write("オファーなし（今はダミー表示）")
 
     # =========================
-    # 右カラム：行動・イベント & ログ
+    # 右カラム：ログ & 行動・イベント
     # =========================
     with col_chat:
-        st.markdown("### 🏃 行動 / イベント")
-
+        # 先にイベント状態だけ取得しておく
         ev = st.session_state.current_event
+
+        # =========================
+        # 上：ログ表示
+        # =========================
+        st.markdown("### 📜 ログ")
+        with st.container(height=400):
+            for m in st.session_state.messages:
+                st.chat_message(m["role"]).write(m["content"])
+
+        # =========================
+        # 下：行動 / イベント
+        # =========================
+        st.markdown("### 🏃 行動 / イベント")
 
         # イベントがない → 「時間を進める」ボタンだけ
         if not ev:
@@ -946,7 +1551,8 @@ elif st.session_state.game_phase == "main":
                             game_data.save_game(p)
                             st.rerun()
 
-            # 自由記述アクション
+        # 自由記述アクション
+        if ev:
             free = st.chat_input("自由記述で行動する", key="free_action")
             if free:
                 res = resolve_action(p, free, ev.get('description'))
@@ -997,10 +1603,3 @@ elif st.session_state.game_phase == "main":
                     st.session_state.current_event = None
                     game_data.save_game(p)
                     st.rerun()
-
-        # ログ表示
-        st.markdown("### 📜 ログ")
-        with st.container(height=400):
-            for m in st.session_state.messages:
-                st.chat_message(m["role"]).write(m["content"])
-
