@@ -40,6 +40,42 @@ def determine_category(team_name):
         return "Youth"
     else:
         return "Professional"
+# --- 便利関数 ---
+def render_stat(col, label, value, sub=None):
+    """
+    1行のメトリクスをコンパクトなカードで表示する。
+    長い数字も折り返して潰れないようにする。
+    """
+    col.markdown(
+        f"""
+        <div style="
+            padding:4px 6px;
+            border-radius:6px;
+            border:1px solid rgba(255,255,255,0.15);
+            background-color:rgba(0,0,0,0.15);
+            ">
+          <div style="font-size:0.70rem; opacity:0.7; margin-bottom:2px;">
+            {label}
+          </div>
+          <div style="
+              font-size:0.95rem;
+              font-weight:600;
+              line-height:1.2;
+              word-wrap:break-word;
+              word-break:break-all;
+          ">
+            {value}
+          </div>
+          {f'<div style="font-size:0.65rem; opacity:0.65; margin-top:1px;">{sub}</div>' if sub else ""}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def determine_category(team_name):
+    name = team_name.replace(" ", "").replace("　", "").upper()
+    ...
+
 
 
 def safe_json_load(text):
@@ -612,16 +648,27 @@ elif st.session_state.game_phase == "main":
     # =========================
     with col_main:
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Date", str(p.current_date))
-        c2.metric("Funds", f"¥{p.funds:,}")
-        c3.metric("CA/PA", f"{p.ca:.1f}/{p.pa:.1f}")
-        c4.metric("Value", f"€{int(p.value):,}")
-        c5.metric("HP", f"{p.hp}")
-        c6.metric("MP", f"{p.mp}")
+
+        # Date
+        render_stat(c1, "Date", str(p.current_date))
+
+        # Funds（長い桁数でも折り返して表示）
+        render_stat(c2, "Funds (¥)", f"{p.funds:,}")
+
+        # CA / PA
+        render_stat(c3, "CA / PA", f"{p.ca:.2f} / {p.pa:.2f}")
+
+        # Market Value（€）
+        render_stat(c4, "Value (€)", f"{int(p.value):,}")
+
+        # HP / MP
+        render_stat(c5, "HP", f"{p.hp}")
+        render_stat(c6, "MP", f"{p.mp}")
 
         tab_attr, tab_roster, tab_year, tab_week, tab_timetable, tab_rel, tab_shop, tab_transfer = st.tabs(
             ["📊 能力/適性", "👥 名簿", "📅 年間日程", "🗓 週間日程", "⏰ 時間割", "🤝 人間関係", "🛍️ ショップ", "📩 移籍"]
         )
+
 
         # ========== タブ: 能力 / ポジション適性 ==========
         with tab_attr:
