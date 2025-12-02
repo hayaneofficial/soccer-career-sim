@@ -28,6 +28,8 @@ if "temp_profile" not in st.session_state:
     st.session_state.temp_profile = {}
 if "temp_data" not in st.session_state:
     st.session_state.temp_data = {}
+if "transfer_notice" not in st.session_state:
+    st.session_state.transfer_notice = None
 
 # --- 便利関数（UI） ---
 def render_stat(col, label, value, sub=None):
@@ -135,6 +137,112 @@ def safe_int(val, default=0):
         return default
 
 
+def convert_position_by_foot(category: str, position: str, foot: str) -> str:
+    if category not in ("HighSchool", "University"):
+        return position
+    if not foot:
+        return position
+    pos = position.upper()
+    if pos == "CB":
+        return "LCB" if foot.startswith("左") else "RCB"
+    if pos == "CMF":
+        return "LCM" if foot.startswith("左") else "RCM"
+    if pos == "CF":
+        return "RCF" if foot.startswith("左") else "LCF"
+    return position
+
+
+def ca_offer_bucket(ca: float) -> str:
+    thresholds = [
+        (37, "大学下位チームベンチ"),
+        (40, "大学Dスタメン"),
+        (45, "大学Cベンチ"),
+        (50, "大学Cスタメン"),
+        (55, "大学Bベンチ"),
+        (60, "大学Bスタメン可"),
+        (70, "大学Aスタメン争い"),
+        (80, "大学Aスタメン / JFL特指クラス"),
+        (90, "J1練習参加・特指レベル"),
+        (100, "J1正規メンバー"),
+        (110, "海外挑戦可能な若手"),
+        (130, "J1エース級"),
+        (140, "日本代表入りレベル"),
+        (150, "日本代表主力"),
+        (160, "欧州主要リーグスタメン級"),
+        (170, "欧州トップクラブ主力候補"),
+        (180, "世界的ビッグクラブ争奪戦"),
+        (200, "歴史的レジェンド"),
+    ]
+    for bound, label in thresholds:
+        if ca <= bound:
+            return label
+    return "特級"  # safety
+
+
+def maybe_generate_transfer_offer(player):
+    """Create a transfer offer based on CA buckets and return it if triggered."""
+    ca = player.ca
+    bucket = ca_offer_bucket(ca)
+    base_chance = 0.0
+    if ca >= 80:
+        base_chance = 0.12
+    elif ca >= 60:
+        base_chance = 0.08
+    elif ca >= 45:
+        base_chance = 0.05
+    elif ca >= 37:
+        base_chance = 0.03
+    if random.random() > base_chance:
+        return None
+
+    leagues = [
+        "明治安田J1リーグ", "明治安田J2リーグ", "関東大学サッカーリーグ1部", "関西学生リーグ1部",
+        "プレミアリーグ", "セリエA", "リーガ・エスパニョーラ", "ブンデスリーガ"
+    ]
+    club_prefix = ["FC", "SC", "AC", "ユナイテッド", "シティ", "ヴィレッジ", "カレッジ"]
+    club_suffix = ["東京", "大阪", "名古屋", "札幌", "マドリード", "ロンドン", "デュッセルドルフ", "フィレンツェ"]
+    category = "Professional" if ca >= 70 else player.team_category
+
+    offer = {
+        "club": f"{random.choice(club_suffix)}{random.choice(club_prefix)}",
+        "league": random.choice(leagues),
+        "category": category,
+        "status": "new",
+        "bucket": bucket,
+        "created": player.current_date.isoformat(),
+        "salary": max(player.salary, int(500000 + ca * 10_000)),
+    }
+    player.transfer_offers.append(offer)
+    return offer
+
+
+def apply_transfer(player, offer):
+    """Apply an accepted offer to the player and regenerate team context."""
+    player.team_name = offer.get("club", player.team_name)
+    player.team_category = offer.get("category", "Professional")
+    player.salary = offer.get("salary", player.salary)
+    player.grade = game_data.TeamGenerator._grade_label(player.team_category, player.age)
+
+    team_info = create_team_data(player.team_name, player.team_category, player.current_date)
+    formation = team_info.get("formation") if team_info else None
+    real_players = team_info.get("real_players", []) if team_info else []
+    members, formation = game_data.TeamGenerator.generate_teammates(
+        player.team_category,
+        formation or game_data.TeamGenerator.DEFAULT_FORMATIONS.get(player.team_category, "4-3-3"),
+        real_players
+    )
+    player.team_members = members
+    player.formation = formation
+    player.update_hierarchy()
+
+
+def offer_summary_text(offer: dict) -> str:
+    return (
+        f"{offer.get('club')} (リーグ: {offer.get('league')})\n"
+        f"想定ロール: {offer.get('bucket')} / 推定年俸: {offer.get('salary'):,}"
+    )
+
+
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
@@ -184,7 +292,7 @@ def create_initial_data(profile_data, category, start_date):
     ability_keys = list(game_data.WEIGHTS.keys())
     ability_keys_text = ", ".join([f'"{k}"' for k in ability_keys])
 
-    prompt = f"""
+    base_prompt = f"""
     サッカースカウトAIとして以下を実行してください。
     プロフィール: {profile_data}
     カテゴリ: {category}
@@ -227,7 +335,19 @@ def create_initial_data(profile_data, category, start_date):
     }}
     """
 
-    return call_gemini(prompt)
+    prompt = base_prompt
+    for _ in range(3):
+        res = call_gemini(prompt)
+        if not res:
+            return res
+        if not res.get("need_questions"):
+            return res
+
+        # Geminiからの追加質問を再度投げ直し、足りない部分を推定させる
+        q_text = "\\n".join(res.get("questions", []))
+        prompt = base_prompt + "\n追加質問にはあなた自身が想像して回答し、全能力値を埋めてください。\n" + q_text
+
+    return res
 
 
 def create_team_data(team_name, category, start_date):
@@ -356,6 +476,9 @@ def create_univ_timetable(player):
       それぞれに講義名または「空きコマ」「自習」などを設定してください。
     - サッカーのトレーニングが「午後〜夕方」に集中している曜日は、
       p4, p5 を空きコマにする など、最低限の両立を意識してください。
+    - それぞれのコマには、次の付加情報を必ず付けてください:
+      - required: "必修" または "選択"
+      - delivery: "オンライン" / "オンデマンド" / "オフライン" のいずれか
     - 履修科目名は、それっぽい日本語の講義名で構いません
       （例: 「経済学入門」「スポーツ科学基礎」「統計学Ⅰ」など）。
 
@@ -367,10 +490,20 @@ def create_univ_timetable(player):
         {{
           "weekday": "Mon",
           "p1": "経済学入門",
+          "p1_required": "必修",
+          "p1_delivery": "オフライン",
           "p2": "統計学Ⅰ",
+          "p2_required": "選択",
+          "p2_delivery": "オンライン",
           "p3": "空きコマ",
+          "p3_required": "選択",
+          "p3_delivery": "オンデマンド",
           "p4": "スポーツ科学基礎",
-          "p5": "空きコマ"
+          "p4_required": "選択",
+          "p4_delivery": "オフライン",
+          "p5": "空きコマ",
+          "p5_required": "選択",
+          "p5_delivery": "オンデマンド"
         }}
       ]
     }}
@@ -383,11 +516,11 @@ def create_univ_timetable(player):
     res = call_gemini(prompt)
     if not res:
         default = [
-            {"weekday": "Mon", "p1": "基礎ゼミ", "p2": "統計学Ⅰ", "p3": "空きコマ", "p4": "スポーツ科学入門", "p5": "空きコマ"},
-            {"weekday": "Tue", "p1": "経済学入門", "p2": "英語リーディング", "p3": "空きコマ", "p4": "情報リテラシー", "p5": "空きコマ"},
-            {"weekday": "Wed", "p1": "社会学概論", "p2": "空きコマ", "p3": "第二外国語", "p4": "空きコマ", "p5": "空きコマ"},
-            {"weekday": "Thu", "p1": "憲法学", "p2": "空きコマ", "p3": "スポーツ心理学", "p4": "空きコマ", "p5": "空きコマ"},
-            {"weekday": "Fri", "p1": "空きコマ", "p2": "空きコマ", "p3": "プロジェクト科目", "p4": "空きコマ", "p5": "空きコマ"},
+            {"weekday": "Mon", "p1": "基礎ゼミ", "p1_required": "必修", "p1_delivery": "オフライン", "p2": "統計学Ⅰ", "p2_required": "必修", "p2_delivery": "オフライン", "p3": "空きコマ", "p3_required": "選択", "p3_delivery": "オンデマンド", "p4": "スポーツ科学入門", "p4_required": "選択", "p4_delivery": "オフライン", "p5": "空きコマ", "p5_required": "選択", "p5_delivery": "オンライン"},
+            {"weekday": "Tue", "p1": "経済学入門", "p1_required": "必修", "p1_delivery": "オフライン", "p2": "英語リーディング", "p2_required": "必修", "p2_delivery": "オンライン", "p3": "空きコマ", "p3_required": "選択", "p3_delivery": "オンデマンド", "p4": "情報リテラシー", "p4_required": "選択", "p4_delivery": "オンライン", "p5": "空きコマ", "p5_required": "選択", "p5_delivery": "オンデマンド"},
+            {"weekday": "Wed", "p1": "社会学概論", "p1_required": "必修", "p1_delivery": "オフライン", "p2": "空きコマ", "p2_required": "選択", "p2_delivery": "オンデマンド", "p3": "第二外国語", "p3_required": "選択", "p3_delivery": "オフライン", "p4": "空きコマ", "p4_required": "選択", "p4_delivery": "オンデマンド", "p5": "空きコマ", "p5_required": "選択", "p5_delivery": "オンライン"},
+            {"weekday": "Thu", "p1": "憲法学", "p1_required": "必修", "p1_delivery": "オフライン", "p2": "空きコマ", "p2_required": "選択", "p2_delivery": "オンデマンド", "p3": "スポーツ心理学", "p3_required": "選択", "p3_delivery": "オフライン", "p4": "空きコマ", "p4_required": "選択", "p4_delivery": "オンライン", "p5": "空きコマ", "p5_required": "選択", "p5_delivery": "オンデマンド"},
+            {"weekday": "Fri", "p1": "空きコマ", "p1_required": "選択", "p1_delivery": "オンデマンド", "p2": "空きコマ", "p2_required": "選択", "p2_delivery": "オンライン", "p3": "プロジェクト科目", "p3_required": "必修", "p3_delivery": "オフライン", "p4": "空きコマ", "p4_required": "選択", "p4_delivery": "オンデマンド", "p5": "空きコマ", "p5_required": "選択", "p5_delivery": "オンライン"},
         ]
         return {"timetable": default}
 
@@ -573,6 +706,77 @@ def create_schedule_data(team_name, category, year):
         res["schedule"] = []
 
     return res
+
+
+def summarize_annual_outline(schedule, year):
+    """Rough monthly outline (off-season, transfer, camps) before daily play."""
+    month_buckets = {m: [] for m in range(1, 13)}
+    for match in schedule:
+        date_str = match.get("date")
+        try:
+            d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if d.year != year:
+            continue
+        month_buckets[d.month].append(match)
+
+    outline = []
+    for month in range(1, 13):
+        matches = month_buckets[month]
+        match_count = len(matches)
+        label = "リーグ/カップ進行"
+        if match_count == 0:
+            label = "オフ・自主トレ期間"
+        elif match_count <= 2:
+            label = "キャンプ・調整中心"
+        if month in (1, 7):
+            label += " / 移籍期間を想定"
+        outline.append({
+            "month": f"{month}月",
+            "matches": match_count,
+            "note": label
+        })
+    return outline
+
+
+def align_weekly_plan_with_schedule(plan, schedule):
+    """Match weekly plan match-days to the most common schedule weekdays."""
+    if not plan or not schedule:
+        return plan, False
+
+    weekday_count = {}
+    for match in schedule:
+        try:
+            d = datetime.datetime.strptime(match.get("date", ""), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        wd = d.strftime("%a")
+        weekday_count[wd] = weekday_count.get(wd, 0) + 1
+
+    if not weekday_count:
+        return plan, False
+
+    common_days = sorted(weekday_count.items(), key=lambda x: x[1], reverse=True)
+    target_days = {day for day, _ in common_days[:2]}
+
+    updated = False
+    new_plan = []
+    for entry in plan:
+        weekday = entry.get("weekday")
+        if weekday in target_days:
+            afternoon = entry.get("afternoon", "")
+            evening = entry.get("evening", "")
+            if "試合" not in afternoon:
+                afternoon = "試合 / 公式戦" if afternoon == "" else f"試合 / 公式戦 / {afternoon}"
+                updated = True
+            if "試合" not in evening:
+                evening = "リカバリー or 移動" if evening == "" else f"{evening} / リカバリー"
+                updated = True
+            entry = {**entry, "afternoon": afternoon, "evening": evening}
+        new_plan.append(entry)
+
+    return new_plan, updated
 
 
 
@@ -768,6 +972,7 @@ elif st.session_state.game_phase == "create":
         c5, c6 = st.columns(2)
         height = c5.number_input("身長 (cm)", 160, 200, 175)
         weight = c6.number_input("体重 (kg)", 50, 100, 68)
+        foot = st.selectbox("利き足", ["右", "左", "両"])
 
     with st.expander("詳細設定", expanded=True):
         history = st.text_area("経歴", "高校時代は無名だったが...")
@@ -792,6 +997,7 @@ elif st.session_state.game_phase == "create":
                 "age": age,
                 "height": height,
                 "weight": weight,
+                "foot": foot,
                 "history": history,
                 "style": style,
                 "relations": relation_desc,
@@ -809,7 +1015,8 @@ elif st.session_state.game_phase == "create":
                     "cat": cat,
                     "start_date": str(start_date),
                     "stats": res,
-                    "position": position
+                    "position": position,
+                    "foot": foot,
                 }
                 st.session_state.game_phase = "review_stats"
                 st.rerun()
@@ -828,18 +1035,17 @@ elif st.session_state.game_phase == "review_stats":
         if k in raw_attr and raw_attr[k] is not None:
             base_attrs[k] = float(raw_attr[k])
 
-    # CAプレビュー
-    total_score = sum(base_attrs[key] * game_data.WEIGHTS[key] for key in game_data.WEIGHTS.keys())
-    ca_preview = (total_score / game_data.THEORETICAL_MAX_SCORE) * 200
-
     c1, c2 = st.columns(2)
     with c1:
         st.write("能力値（FM準拠・全項目）")
-        st.caption(f"現在の推定CA: {ca_preview:.2f}")
         edited_attr = st.data_editor(
             pd.DataFrame([base_attrs]),
             use_container_width=True
         )
+        ca_dict = edited_attr.to_dict(orient='records')[0]
+        total_score = sum(ca_dict[key] * game_data.WEIGHTS[key] for key in game_data.WEIGHTS.keys())
+        ca_preview = (total_score / game_data.THEORETICAL_MAX_SCORE) * 200
+        st.caption(f"現在の推定CA: {ca_preview:.2f}")
 
     with c2:
         st.write("人間関係")
@@ -858,8 +1064,10 @@ elif st.session_state.game_phase == "review_stats":
             st.session_state.temp_data["start_date"],
             "%Y-%m-%d"
         ).date()
-
-        pos_val = st.session_state.temp_data.get("position", "MF")
+        category = st.session_state.temp_data.get("cat", "Professional")
+        raw_position = st.session_state.temp_data.get("position", "MF")
+        foot = st.session_state.temp_data.get("foot", "")
+        pos_val = convert_position_by_foot(category, raw_position, foot)
 
         p = game_data.Player(
             prof["name"],
@@ -869,10 +1077,10 @@ elif st.session_state.game_phase == "review_stats":
             funds=funds,
             salary=salary,
             team_name=prof["team"],
-            start_date=start_d
+            start_date=start_d,
+            team_category=category,
+            pa=float(st.session_state.temp_data["base"].get("pa", 150)),
         )
-        p.pa = float(st.session_state.temp_data["base"]["pa"])
-        p.team_category = st.session_state.temp_data["cat"]
 
         for _, row in edited_npcs.iterrows():
             p.add_npc(
@@ -1028,7 +1236,8 @@ elif st.session_state.game_phase == "review_team":
             "Age": m.age,
             "CA": float(m.ca),
             "PA": float(getattr(m, "pa", 0)),
-            "Value": int(getattr(m, "value", 0))
+            "Value": int(getattr(m, "value", 0)),
+            "Grade": getattr(m, "grade", "") if p.team_category in ("HighSchool", "University") else ""
         })
     edited_df = st.data_editor(
         pd.DataFrame(data),
@@ -1046,7 +1255,8 @@ elif st.session_state.game_phase == "review_team":
                 "age": row.get("Age"),
                 "ca": row.get("CA"),
                 "pa": row.get("PA"),
-                "value": row.get("Value")
+                "value": row.get("Value"),
+                "grade": row.get("Grade", "")
             })
 
         p.team_members = game_data.TeamGenerator.finalize_team(
@@ -1163,12 +1373,31 @@ elif st.session_state.game_phase == "univ_timetable":
                 p.school_timetable = res.get("timetable", [])
                 game_data.save_game(p)
 
-    st.info("サッカー部の予定と両立できるように、AIが提案した履修時間割です。必要に応じて講義名や空きコマを編集してください。")
+    st.info("サッカー部の予定と両立できるように、AIが提案した履修時間割です。必修/選択と受講形態（オンライン/オンデマンド/オフライン）も編集できます。")
 
     if p.school_timetable:
         df_tt = pd.DataFrame(p.school_timetable)
     else:
-        df_tt = pd.DataFrame(columns=["weekday", "p1", "p2", "p3", "p4", "p5"])
+        df_tt = pd.DataFrame(
+            columns=[
+                "weekday",
+                "p1",
+                "p1_required",
+                "p1_delivery",
+                "p2",
+                "p2_required",
+                "p2_delivery",
+                "p3",
+                "p3_required",
+                "p3_delivery",
+                "p4",
+                "p4_required",
+                "p4_delivery",
+                "p5",
+                "p5_required",
+                "p5_delivery",
+            ]
+        )
 
     edited_tt = st.data_editor(
         df_tt,
@@ -1197,6 +1426,11 @@ elif st.session_state.game_phase == "review_schedule":
                     p.competitions = res.get("competitions", [])
                 # 実際に使う年間日程
                 p.schedule = res.get("schedule", [])
+                if p.team_weekly_plan:
+                    aligned, changed = align_weekly_plan_with_schedule(p.team_weekly_plan, p.schedule)
+                    if changed:
+                        p.team_weekly_plan = aligned
+                        st.info("年間試合日程に合わせて週間スケジュールの試合日を同期しました。")
                 game_data.save_game(p)
 
     edited_sched = st.data_editor(
@@ -1207,6 +1441,11 @@ elif st.session_state.game_phase == "review_schedule":
 
     if st.button("日程確定 & シーズン開幕"):
         p.schedule = edited_sched.to_dict(orient='records')
+        if p.team_weekly_plan:
+            aligned, changed = align_weekly_plan_with_schedule(p.team_weekly_plan, p.schedule)
+            if changed:
+                p.team_weekly_plan = aligned
+                st.info("編集後の日程に合わせて週間スケジュールを調整しました。")
         game_data.save_game(p)
         st.session_state.game_phase = "story_schedule"
         st.rerun()
@@ -1219,6 +1458,11 @@ elif st.session_state.game_phase == "story_schedule":
     if p.schedule:
         opener = p.schedule[0]
         st.info(f"開幕戦は **{opener.get('date')}** vs **{opener.get('opponent')}** です！")
+
+    if p.schedule:
+        outline = summarize_annual_outline(p.schedule, p.current_date.year)
+        st.subheader("ざっくり年間スケジュール")
+        st.dataframe(pd.DataFrame(outline), use_container_width=True)
 
     if st.button("日常パートへ"):
         st.session_state.game_phase = "main"
@@ -1244,7 +1488,8 @@ elif st.session_state.game_phase == "main":
         c1, c2, c3, c4, c5, c6 = st.columns(6)
 
         # Date
-        render_stat(c1, "Date", str(p.current_date))
+        date_label = f"{p.current_date} ({p.current_date.strftime('%a')})"
+        render_stat(c1, "Date", date_label)
 
         # Funds（長い桁数でも折り返して表示）
         render_stat(c2, "Funds (¥)", f"{p.funds:,}")
@@ -1259,8 +1504,21 @@ elif st.session_state.game_phase == "main":
         render_stat(c5, "HP", f"{p.hp}")
         render_stat(c6, "MP", f"{p.mp}")
 
-        tab_attr, tab_roster, tab_year, tab_week, tab_timetable, tab_rel, tab_shop, tab_transfer = st.tabs(
-            ["📊 能力/適性", "👥 名簿", "📅 年間日程", "🗓 週間日程", "⏰ 時間割", "🤝 人間関係", "🛍️ ショップ", "📩 移籍"]
+        # 生活水準の即時切替（HPやコストに影響）
+        living_levels = {"節約": 1000, "標準": 3000, "充実": 8000}
+        new_level = st.select_slider(
+            "生活水準 (1日コスト)",
+            options=list(living_levels.keys()),
+            value=getattr(p, "living_standard", "標準"),
+            format_func=lambda x: f"{x} / ¥{living_levels[x]:,}/day"
+        )
+        if new_level != p.living_standard:
+            p.living_standard = new_level
+            game_data.save_game(p)
+            st.toast("生活水準を更新しました")
+
+        tab_attr, tab_roster, tab_standings, tab_year, tab_week, tab_timetable, tab_rel, tab_shop, tab_transfer = st.tabs(
+            ["📊 能力/適性", "👥 名簿", "📈 順位表", "📅 年間日程", "🗓 週間日程", "⏰ 時間割", "🤝 人間関係", "🛍️ ショップ", "📩 移籍"]
         )
 
         # ========== タブ: 能力 / ポジション適性 ==========
@@ -1313,21 +1571,70 @@ elif st.session_state.game_phase == "main":
                     "PA": f"{getattr(m, 'pa', 0):.1f}",
                     "Hierarchy": getattr(m, "hierarchy", ""),
                     "Foot": getattr(m, "foot", ""),
-                    "Height": getattr(m, "height", ""),
-                    "Value": f"€{getattr(m, 'value', 0):,}"
+                    "Height": getattr(m, "height_cm", getattr(m, "height", "")),
+                    "Value": f"€{getattr(m, 'value', 0):,}",
+                    "Grade": getattr(m, "grade", ""),
+                    "TransferFlag": getattr(m, "transfer_flag", False),
                 }
                 # 高校・大学のときは年齢も見えた方が嬉しいので常に入れる
                 row["Age"] = getattr(m, "age", "")
                 data.append(row)
 
             if data:
-                st.dataframe(
+                edited_df = st.data_editor(
                     pd.DataFrame(data),
                     height=500,
-                    use_container_width=True
+                    use_container_width=True,
+                    num_rows="dynamic"
                 )
+                if st.button("名簿を更新"):
+                    new_members = []
+                    for _, row in edited_df.iterrows():
+                        try:
+                            new_members.append(
+                                game_data.TeamMember(
+                                    name=str(row.get("Name", "")).replace("★ ", ""),
+                                    position=row.get("Pos", ""),
+                                    number=int(row.get("No", 0)),
+                                    age=int(row.get("Age", 0)) if row.get("Age", "") != "" else 0,
+                                    ca=float(str(row.get("CA", 0)).replace("★", "")),
+                                    pa=float(str(row.get("PA", 0)).replace("★", "")),
+                                    height_cm=int(row.get("Height", 0)) if row.get("Height", "") != "" else 0,
+                                    value=safe_int(row.get("Value", 0)),
+                                    grade=row.get("Grade", ""),
+                                    transfer_flag=bool(row.get("TransferFlag", False)),
+                                )
+                            )
+                        except Exception:
+                            continue
+                    if new_members:
+                        p.team_members = new_members
+                        p.update_hierarchy()
+                        game_data.save_game(p)
+                        st.success("名簿を更新しました")
             else:
                 st.info("チームメンバーがまだいません。")
+
+        # ========== タブ: 順位表 ==========
+        with tab_standings:
+            st.write("### 順位表（編集可）")
+            standings = p.competitions or []
+            if not standings:
+                # 簡易初期値：スケジュールから大会名を拾う
+                comp_names = list({m.get("competition", "") for m in p.schedule if m.get("competition")})
+                if not comp_names:
+                    comp_names = ["リーグ"]
+                standings = [
+                    {"competition": comp, "team": p.team_name, "played": 0, "win": 0, "draw": 0, "loss": 0, "points": 0}
+                    for comp in comp_names
+                ]
+
+            df_st = pd.DataFrame(standings)
+            edited_st = st.data_editor(df_st, num_rows="dynamic", use_container_width=True)
+            if st.button("順位表を保存"):
+                p.competitions = edited_st.to_dict(orient="records")
+                game_data.save_game(p)
+                st.toast("順位表を保存しました")
 
         # ========== タブ: 年間日程 ==========
         with tab_year:
@@ -1422,22 +1729,30 @@ elif st.session_state.game_phase == "main":
 
         # ========== タブ: 人間関係 ==========
         with tab_rel:
-            if p.npcs:
-                rel_rows = []
-                for n in p.npcs:
-                    rel_rows.append({
-                        "Role": n.role,
-                        "Name": n.name,
-                        "Relation": n.relation,
-                        "Description": n.description
-                    })
-                st.dataframe(
-                    pd.DataFrame(rel_rows),
-                    use_container_width=True,
-                    height=400
-                )
-            else:
-                st.info("人間関係データがまだありません。")
+            rel_rows = []
+            for n in p.npcs or []:
+                rel_rows.append({
+                    "Role": n.role,
+                    "Name": n.name,
+                    "Relation": n.relation,
+                    "Description": n.description
+                })
+            df_rel = pd.DataFrame(rel_rows) if rel_rows else pd.DataFrame(columns=["Role", "Name", "Relation", "Description"])
+            edited_rel = st.data_editor(df_rel, num_rows="dynamic", use_container_width=True, height=400)
+            if st.button("人間関係を更新"):
+                new_npcs = []
+                for _, row in edited_rel.iterrows():
+                    if not row.get("Name"):
+                        continue
+                    new_npcs.append(game_data.NPC(
+                        role=row.get("Role", ""),
+                        name=row.get("Name", ""),
+                        relation=safe_float(row.get("Relation", 0)),
+                        description=row.get("Description", ""),
+                    ))
+                p.npcs = new_npcs
+                game_data.save_game(p)
+                st.success("人間関係を更新しました")
 
         # ========== タブ: ショップ ==========
         with tab_shop:
@@ -1459,7 +1774,29 @@ elif st.session_state.game_phase == "main":
 
         # ========== タブ: 移籍 ==========
         with tab_transfer:
-            st.write("オファーなし（今はダミー表示）")
+            st.write("### 受信オファー一覧")
+            if p.transfer_offers:
+                df = pd.DataFrame(p.transfer_offers)
+                st.dataframe(df, use_container_width=True, height=300)
+                for idx, offer in enumerate(p.transfer_offers):
+                    st.markdown(f"**{offer.get('club')}** ({offer.get('league')}) - 状態: {offer.get('status')}")
+                    cols = st.columns(3)
+                    if cols[0].button("承諾", key=f"accept_offer_{idx}"):
+                        offer["status"] = "accepted"
+                        apply_transfer(p, offer)
+                        game_data.save_game(p)
+                        st.success(f"{offer.get('club')} に加入しました！")
+                        st.rerun()
+                    if cols[1].button("保留", key=f"hold_offer_{idx}"):
+                        offer["status"] = "held"
+                        game_data.save_game(p)
+                        st.info("オファーを保留にしました。")
+                    if cols[2].button("辞退", key=f"decline_offer_{idx}"):
+                        offer["status"] = "declined"
+                        game_data.save_game(p)
+                        st.warning("オファーを辞退しました。")
+            else:
+                st.info("現在オファーはありません。")
 
     # =========================
     # 右カラム：ログ & 行動・イベント
@@ -1467,6 +1804,30 @@ elif st.session_state.game_phase == "main":
     with col_chat:
         # 先にイベント状態だけ取得しておく
         ev = st.session_state.current_event
+
+        # 新着オファー通知
+        notice = st.session_state.transfer_notice
+        if notice:
+            with st.warning("📩 新しい移籍オファー", icon="📨"):
+                st.write(offer_summary_text(notice))
+                c1, c2, c3 = st.columns(3)
+                if c1.button("承諾", key="notice_accept"):
+                    notice["status"] = "accepted"
+                    apply_transfer(p, notice)
+                    st.session_state.transfer_notice = None
+                    game_data.save_game(p)
+                    st.success(f"{notice.get('club')} に加入しました！")
+                    st.rerun()
+                if c2.button("保留", key="notice_hold"):
+                    notice["status"] = "held"
+                    st.session_state.transfer_notice = None
+                    game_data.save_game(p)
+                    st.info("オファーを保留しました。移籍タブで確認できます。")
+                if c3.button("辞退", key="notice_decline"):
+                    notice["status"] = "declined"
+                    st.session_state.transfer_notice = None
+                    game_data.save_game(p)
+                    st.warning("オファーを辞退しました。")
 
         # =========================
         # 上：ログ表示
@@ -1547,6 +1908,13 @@ elif st.session_state.game_phase == "main":
                             p.hp -= safe_int(res.get("hp_cost", 0))
                             p.mp -= safe_int(res.get("mp_cost", 0))
                             p.advance_day(1)
+                            offer = maybe_generate_transfer_offer(p)
+                            if offer:
+                                st.session_state.transfer_notice = offer
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": f"📩 新しいオファー\n{offer_summary_text(offer)}"
+                                })
                             st.session_state.current_event = None
                             game_data.save_game(p)
                             st.rerun()
@@ -1600,6 +1968,13 @@ elif st.session_state.game_phase == "main":
                     p.hp -= safe_int(res.get("hp_cost", 0))
                     p.mp -= safe_int(res.get("mp_cost", 0))
                     p.advance_day(1)
+                    offer = maybe_generate_transfer_offer(p)
+                    if offer:
+                        st.session_state.transfer_notice = offer
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": f"📩 新しいオファー\n{offer_summary_text(offer)}"
+                        })
                     st.session_state.current_event = None
                     game_data.save_game(p)
                     st.rerun()
