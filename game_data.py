@@ -231,6 +231,8 @@ class Player:
         # プレイヤー自身の序列を保存（UI表示用）
         my_member = next((m for m in self.team_members if m.name == self.name), None)
         self.hierarchy = my_member.hierarchy if my_member else None
+        # イーブン競争後の名前リストを保存
+        self.hierarchy = [m.name for m in self.team_members]
 
     def _handle_age_and_grade_rollover(self, old_date: datetime.date, new_date: datetime.date) -> None:
         """Advance age on birthday and promote school grades at fiscal year end."""
