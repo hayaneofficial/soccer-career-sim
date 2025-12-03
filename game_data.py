@@ -91,6 +91,7 @@ class TeamMember:
     value: int = 0
     grade: str = ""
     transfer_flag: bool = False
+    hierarchy: int = 0
 
     def to_dict(self) -> Dict:
         return dataclasses.asdict(self)
@@ -223,6 +224,13 @@ class Player:
                 form_factor = (self.hp + self.mp) / 200 if hasattr(self, "hp") else 0.5
                 if diff <= 1 or random.random() < form_factor:
                     self.team_members[i], self.team_members[i + 1] = b, a
+        # イーブン競争後に序列を付与
+        for idx, member in enumerate(self.team_members, start=1):
+            member.hierarchy = idx
+
+        # プレイヤー自身の序列を保存（UI表示用）
+        my_member = next((m for m in self.team_members if m.name == self.name), None)
+        self.hierarchy = my_member.hierarchy if my_member else None
         # イーブン競争後の名前リストを保存
         self.hierarchy = [m.name for m in self.team_members]
 

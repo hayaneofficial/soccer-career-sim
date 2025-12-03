@@ -1275,14 +1275,18 @@ elif st.session_state.game_phase == "story_hierarchy":
     p = st.session_state.player
     st.title("📋 序列発表")
 
-    st.success(f"あなたの現在の序列: **{p.hierarchy}**")
+    my_member = next((m for m in p.team_members if m.name == p.name), None)
+    my_rank = getattr(my_member, "hierarchy", None)
+    rank_label = f"{my_rank}位 / {len(p.team_members)}" if my_rank else "順位計測中"
+    st.success(f"あなたの現在の序列: **{rank_label}**")
 
     my_idx = next((i for i, m in enumerate(p.team_members) if m.name == p.name), 0)
     rivals = p.team_members[max(0, my_idx - 2): min(len(p.team_members), my_idx + 3)]
     st.write("### ポジション争い")
-    for m in rivals:
+    for i, m in enumerate(rivals, start=max(1, my_idx - 1)):
+        rank = getattr(m, "hierarchy", i)
         mark = "👈 YOU" if m.name == p.name else ""
-        st.write(f"{m.hierarchy} | {m.name} (CA:{m.ca:.1f}) {mark}")
+        st.write(f"{rank}位 | {m.name} (CA:{m.ca:.1f}) {mark}")
 
     # ★変更：まずはチームの週間スケジュールを見に行く
     if st.button("チームの週間スケジュールを見る"):
