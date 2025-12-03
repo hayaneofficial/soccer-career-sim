@@ -1,1605 +1,567 @@
-import streamlit as st
-import google.generativeai as genai
-import game_data
+"""Core data models and helpers for the football career simulator.
+
+This module focuses on stable, lightweight data structures that the
+Streamlit UI in ``app.py`` relies on. The previous version accidentally
+duplicated UI code and missed key constants/classes such as ``WEIGHTS``
+and ``Player``; this rewrite restores those foundations so the app can
+run without undefined references.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime
 import json
 import random
-import datetime
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import time
-import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-# ページ設定
-st.set_page_config(page_title="Football Career AI", layout="wide", initial_sidebar_state="collapsed")
+# --- Ability weights (FM-like attributes) ---------------------------------
+# The weights are intentionally modest and balanced; they are only used for
+# CA/PA preview calculations inside the UI.
+WEIGHTS: Dict[str, float] = {
+    "Decisions": 1.2,
+    "Anticipation": 1.1,
+    "Composure": 1.0,
+    "WorkRate": 1.0,
+    "Teamwork": 1.0,
+    "Positioning": 1.0,
+    "OffTheBall": 1.0,
+    "Vision": 1.0,
+    "Versatility": 0.9,
+    "Flair": 0.8,
+    "Dribbling": 1.0,
+    "Finishing": 1.0,
+    "FirstTouch": 1.0,
+    "Passing": 1.0,
+    "Tackling": 1.0,
+    "Marking": 1.0,
+    "Heading": 0.9,
+    "Pace": 1.0,
+    "Acceleration": 1.0,
+    "Stamina": 1.0,
+    "Strength": 1.0,
+    "Balance": 0.8,
+    "JumpingReach": 0.8,
+    "Agility": 0.8,
+    "Concentration": 0.9,
+    "Determination": 0.9,
+    "Leadership": 0.8,
+    "Bravery": 0.8,
+    "Aggression": 0.6,
+    "WeakFoot": 0.6,
+    # Mental/hidden style attributes often requested by the prompt
+    "Adaptability": 0.5,
+    "Ambition": 0.5,
+    "Controversy": 0.3,
+    "Loyalty": 0.5,
+    "Pressure": 0.5,
+    "Professionalism": 0.7,
+    "Sportsmanship": 0.4,
+    "Temperament": 0.4,
+    "InjuryProneness": 0.3,
+    "ImportantMatches": 0.5,
+    "Dirtiness": 0.3,
+}
 
-# --- セッション初期化 ---
-if "player" not in st.session_state:
-    st.session_state.player = None
-if "game_phase" not in st.session_state:
-    st.session_state.game_phase = "start"
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "current_event" not in st.session_state:
-    st.session_state.current_event = None
-if "create_log" not in st.session_state:
-    st.session_state.create_log = []
-if "temp_profile" not in st.session_state:
-    st.session_state.temp_profile = {}
-if "temp_data" not in st.session_state:
-    st.session_state.temp_data = {}
-
-# --- 便利関数（UI） ---
-def render_stat(col, label, value, sub=None):
-    """
-    1行のメトリクスをコンパクトなカードで表示する。
-    長い数字も折り返して潰れないようにする。
-    """
-    col.markdown(
-        f"""
-        <div style="
-            padding:4px 6px;
-            border-radius:6px;
-            border:1px solid rgba(255,255,255,0.15);
-            background-color:rgba(0,0,0,0.15);
-            ">
-          <div style="font-size:0.70rem; opacity:0.7; margin-bottom:2px;">
-            {label}
-          </div>
-          <div style="
-              font-size:0.95rem;
-              font-weight:600;
-              line-height:1.2;
-              word-wrap:break-word;
-              word-break:break-all;
-          ">
-            {value}
-          </div>
-          {f'<div style="font-size:0.65rem; opacity:0.65; margin-top:1px;">{sub}</div>' if sub else ""}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+THEORETICAL_MAX_SCORE = sum(20 * w for w in WEIGHTS.values())
 
 
-# --- カテゴリ判定 ---
-def determine_category(team_name: str) -> str:
-    """
-    チーム名からカテゴリを判定する共通関数。
-    HighSchool / University / Youth / Professional のどれかを返す。
-    """
-    if not team_name:
-        return "Professional"
+# --- Data classes ---------------------------------------------------------
+@dataclasses.dataclass
+class NPC:
+    name: str
+    role: str
+    relation: float = 0.0
+    description: str = ""
 
-    name = team_name.replace(" ", "").replace("　", "")
-    name_low = name.lower()
-
-    # 高校
-    if ("高校" in name) or ("高等学校" in name) or ("highschool" in name_low) or ("high-school" in name_low):
-        return "HighSchool"
-
-    # 大学
-    if ("大学" in name) or ("大學" in name) or ("univ" in name_low) or ("university" in name_low) or ("college" in name_low):
-        return "University"
-
-    # ユース / U-18 等
-    if ("ユース" in name) or ("youth" in name_low):
-        return "Youth"
-    if re.search(r"\bu-?1[0-9]\b", name_low) or "u18" in name_low or "u17" in name_low or "u16" in name_low:
-        return "Youth"
-    if "u-18" in name_low or "u18" in name_low:
-        return "Youth"
-
-    # それ以外はプロ扱い
-    return "Professional"
+    def to_dict(self) -> Dict:
+        return dataclasses.asdict(self)
 
 
-# --- 汎用ユーティリティ ---
-def safe_json_load(text):
-    try:
-        text = text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
-        if isinstance(data, list):
-            return data[0] if data else {}
-        return data
-    except Exception:
-        return {}
+@dataclasses.dataclass
+class TeamMember:
+    name: str
+    position: str
+    number: int = 0
+    age: int = 20
+    ca: float = 90.0
+    pa: float = 120.0
+    height_cm: int = 175
+    value: int = 0
+    grade: str = ""
+    transfer_flag: bool = False
+    hierarchy: int = 0
+
+    def to_dict(self) -> Dict:
+        return dataclasses.asdict(self)
 
 
-def safe_float(val, default=0.0):
-    try:
-        return float(val)
-    except Exception:
-        return default
+@dataclasses.dataclass
+class Player:
+    name: str
+    position: str
+    age: int
+    attributes: Dict[str, float]
+    funds: int = 0
+    salary: int = 0
+    team_name: str = ""
+    team_category: str = "Professional"
+    start_date: Optional[datetime.date] = None
+    birthday: Optional[datetime.date] = None
+    grade: str = ""
+    pa: float = 150.0
+    hp: int = 100
+    mp: int = 100
+    schedule: List[Dict] = dataclasses.field(default_factory=list)
+    team_members: List[TeamMember] = dataclasses.field(default_factory=list)
+    npcs: List[NPC] = dataclasses.field(default_factory=list)
+    team_weekly_plan: List[Dict] = dataclasses.field(default_factory=list)
+    position_apt: Dict[str, float] = dataclasses.field(default_factory=dict)
+    formation: str = ""
+    agent_type: str = ""
+    competitions: List[Dict] = dataclasses.field(default_factory=list)
+    living_standard: str = "標準"
+    school_timetable: List[Dict] = dataclasses.field(default_factory=list)
+    transfer_offers: List[Dict] = dataclasses.field(default_factory=list)
 
+    def __post_init__(self):
+        self.current_date = self.start_date or datetime.date.today()
+        if self.birthday is None and self.start_date:
+            # 初期値として開始日を誕生日扱いにする（後で編集可能）
+            self.birthday = self.start_date
+        if not self.grade:
+            self.grade = TeamGenerator._grade_label(self.team_category, self.age)
+        self.attributes = self._fill_missing_attributes(self.attributes)
+        self.ca = self._compute_ca()
 
-def safe_int(val, default=0):
-    try:
-        if isinstance(val, (int, float)):
-            return int(val)
-        val_str = str(val).lower()
-        multiplier = 1
-        if 'm' in val_str:
-            multiplier = 1_000_000
-        elif 'k' in val_str:
-            multiplier = 1_000
-        elif '億' in val_str:
-            multiplier = 100_000_000
-        elif '万' in val_str:
-            multiplier = 10_000
-        clean_str = re.sub(r'[^\d.]', '', val_str)
-        if not clean_str:
-            return default
-        return int(float(clean_str) * multiplier)
-    except Exception:
-        return default
+    # --- Core helpers --------------------------------------------------
+    def _fill_missing_attributes(self, attrs: Dict[str, float]) -> Dict[str, float]:
+        merged = {k: 10.0 for k in WEIGHTS.keys()}
+        for k, v in (attrs or {}).items():
+            if k in merged and v is not None:
+                try:
+                    merged[k] = float(v)
+                except Exception:
+                    merged[k] = 10.0
+        return merged
 
+    def _compute_ca(self) -> float:
+        total = sum(self.attributes[k] * WEIGHTS[k] for k in WEIGHTS.keys())
+        return (total / THEORETICAL_MAX_SCORE) * 200
 
-# --- サイドバー ---
-with st.sidebar:
-    st.header("⚙️ 設定")
-    api_key_input = st.text_input("Gemini APIキー", type="password")
-    api_key = api_key_input.strip() if api_key_input else None
-
-    # モデル選択
-    model_options = [
-        "models/gemini-2.0-flash",
-        "models/gemini-1.5-pro",
-        "models/gemini-3-pro-preview"
-    ]
-    selected_model = st.selectbox("使用モデル", model_options, index=0)
-
-    if st.session_state.player:
-        st.divider()
-        if st.button("💾 手動セーブ"):
-            game_data.save_game(st.session_state.player)
-            st.success("保存しました")
-
-    st.divider()
-    if st.button("リセットして最初から"):
-        st.session_state.clear()
-        st.rerun()
-
-
-# --- Gemini呼び出しラッパー ---
-def call_gemini(prompt):
-    if not api_key:
-        return None
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            selected_model,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        res = model.generate_content(prompt)
-        return safe_json_load(res.text)
-    except Exception as e:
-        st.error(f"Geminiエラー: {e}")
-        return None
-
-
-# --- ゲームロジック関数 ---
-def create_initial_data(profile_data, category, start_date):
-    # FM準拠の能力キー一覧（game_data側と完全一致させる）
-    ability_keys = list(game_data.WEIGHTS.keys())
-    ability_keys_text = ", ".join([f'"{k}"' for k in ability_keys])
-
-    prompt = f"""
-    サッカースカウトAIとして以下を実行してください。
-    プロフィール: {profile_data}
-    カテゴリ: {category}
-    開始日時: {start_date}
-
-    能力値に関する前提:
-    - 能力値はすべて 1.0〜20.0 の数値。
-    - attributes には、必ず次のキーをすべて含めること:
-      {ability_keys_text}
-    - どのキーについても、情報が不足する場合は 10.0 を設定してよい。
-    - 「WeakFoot」は逆足の使える度合い（1.0〜20.0）。
-
-    指示:
-    1. プロフィールに基づき、上記すべての能力値(1.0-20.0)を設定した attributes を作成する。
-       - ただし CA 計算そのものは行わず、能力値のみを決めること。
-    2. 経済状況から所持金(funds)と年俸(salary)を推定する（整数）。
-    3. 人間関係から NPC を数名作成する。
-
-    もし情報が不足している場合は、追加で尋ねるべき質問を返してください。
-    その場合は次の形式で出力してください:
-    {{
-      "need_questions": true,
-      "questions": ["質問1", "質問2", ...]
-    }}
-
-    十分な情報が揃っている場合は、次の形式で出力してください:
-    {{
-        "attributes": {{
-            "Decisions": 11.5,
-            "Anticipation": 10.0,
-            "Composure": 9.0,
-            ...
-            "WeakFoot": 8.0
-        }},
-        "funds": 100000,
-        "salary": 0,
-        "npcs": [
-            {{"role": "父親", "name": "佐藤 太一", "relation": -10, "description": "サッカーに反対している"}}
+    def compute_pap(self) -> float:
+        """Return PAP (汎用性) score based on vision/decision-making attributes."""
+        keys = [
+            "Decisions",
+            "Anticipation",
+            "Composure",
+            "WorkRate",
+            "Teamwork",
+            "Positioning",
+            "OffTheBall",
+            "Vision",
+            "Versatility",
         ]
-    }}
-    """
-
-    return call_gemini(prompt)
-
-
-def create_team_data(team_name, category, start_date):
-    prompt = f"""
-    チーム名「{team_name}」({start_date}時点)のデータを生成せよ。
-    カテゴリ: {category}
-
-    指示:
-    1. 基本フォーメーション(4-3-3等)を推定。
-    2. 実在選手を【必ず25名】リストアップ（不足分は架空）。
-       - 外国人選手・チーム名は「カタカナ」。日本人・日本チームは「漢字」。
-       - 詳細データ: 背番号, 年齢, 利き足, 身長, 市場価値(数値のみ)
-
-    Output JSON:
-    {{
-        "formation": "4-3-3",
-        "real_players": [
-            {{
-                "name": "...",
-                "position": "...",
-                "value": 5000000,
-                "number": 10,
-                "age": 24,
-                "foot": "右",
-                "height": 178
-            }}
-        ]
-    }}
-    """
-    return call_gemini(prompt)
-
-def create_school_timetable(player):
-    """
-    高校/ユースの「学校時間割」を作成する。
-    チーム週間スケジュールと矛盾しないように、授業は基本的に日中、部活は放課後という前提。
-    """
-    team_plan = getattr(player, "team_weekly_plan", [])
-
-    prompt = f"""
-    あなたは日本の高校サッカー部員（または高校年代ユース選手）の
-    「学校の時間割」を設計するAIです。
-
-    [前提]
-    - 氏名: {player.name}
-    - 年齢: {player.age}
-    - チーム: {player.team_name}
-    - チームカテゴリ: {player.team_category}
-    - サッカーの週間スケジュール(概略):
-      {json.dumps(team_plan, ensure_ascii=False)}
-
-    [制約・方針]
-    - 日本の一般的な高校の時間割をベースにすること。
-      - 平日は Mon〜Fri を必須、必要なら Sat に午前授業を入れてよい。
-      - 1日あたりおおよそ 5〜6コマ（p1〜p6）を想定。
-    - サッカー部のトレーニングは「放課後」に行われる前提とし、
-      この時間割の p1〜p6 の中には原則サッカー部の活動を含めないこと。
-    - サッカーの週間スケジュールと大きく矛盾しないように、
-      例: トレーニングが非常にハードな日の翌日は、授業のコマ数をやや抑える など、
-      最低限の整合性は意識してください（ただし細かい時刻までは考えなくてよい）。
-
-    [出力形式]
-    次の形式の JSON のみを出力してください:
-
-    {{
-      "timetable": [
-        {{
-          "weekday": "Mon",
-          "p1": "現代文",
-          "p2": "数学I",
-          "p3": "英語コミュニケーション",
-          "p4": "世界史",
-          "p5": "体育",
-          "p6": "HR"
-        }}
-      ]
-    }}
-
-    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
-    - 少なくとも Mon〜Fri の5日分を含めること。
-    - JSON 以外のテキストは出力してはいけません。
-    """
-
-    res = call_gemini(prompt)
-    if not res:
-        # フォールバック（かなり単純なデフォルト）
-        default = [
-            {"weekday": "Mon", "p1": "現代文", "p2": "数学I", "p3": "英語", "p4": "世界史", "p5": "体育", "p6": "HR"},
-            {"weekday": "Tue", "p1": "数学I", "p2": "英語", "p3": "化学基礎", "p4": "古典", "p5": "地理", "p6": "LHR"},
-            {"weekday": "Wed", "p1": "英語", "p2": "物理基礎", "p3": "現代社会", "p4": "数学A", "p5": "体育", "p6": "HR"},
-            {"weekday": "Thu", "p1": "古典", "p2": "数学I", "p3": "英語", "p4": "生物基礎", "p5": "国語総合", "p6": "HR"},
-            {"weekday": "Fri", "p1": "世界史", "p2": "数学A", "p3": "英語", "p4": "情報", "p5": "体育", "p6": "HR"},
-        ]
-        return {"timetable": default}
-
-    if "timetable" not in res:
-        res["timetable"] = []
-    return res
-
-
-def create_univ_timetable(player):
-    """
-    大学生用の「履修時間割」を作成する。
-    チーム週間スケジュールと矛盾しないように、トレーニング時間帯を避けて講義を配置させる。
-    """
-    team_plan = getattr(player, "team_weekly_plan", [])
-
-    prompt = f"""
-    あなたは日本の大学サッカー部員の履修相談に乗るAIです。
-
-    [前提]
-    - 氏名: {player.name}
-    - 年齢: {player.age}
-    - 所属チーム: {player.team_name}
-    - チームカテゴリ: {player.team_category}
-    - サッカーの週間スケジュール(概略):
-      {json.dumps(team_plan, ensure_ascii=False)}
-
-    [前提（抽象）]
-    - 一般的な日本の大学を想定してよい（例: 1限 9:00〜、2限 10:40〜... 程度）。
-    - サッカーのトレーニングは主に「夕方〜夜」に行われる想定で、
-      heavy な講義はその時間帯には入れないように配慮すること。
-
-    [タスク]
-    - Mon〜Fri を中心に、「1週間の履修時間割」を作成してください。
-    - 各曜日について、p1〜p5 までの5コマを定義し、
-      それぞれに講義名または「空きコマ」「自習」などを設定してください。
-    - サッカーのトレーニングが「午後〜夕方」に集中している曜日は、
-      p4, p5 を空きコマにする など、最低限の両立を意識してください。
-    - 履修科目名は、それっぽい日本語の講義名で構いません
-      （例: 「経済学入門」「スポーツ科学基礎」「統計学Ⅰ」など）。
-
-    [出力形式]
-    次の形式の JSON のみを出力してください:
-
-    {{
-      "timetable": [
-        {{
-          "weekday": "Mon",
-          "p1": "経済学入門",
-          "p2": "統計学Ⅰ",
-          "p3": "空きコマ",
-          "p4": "スポーツ科学基礎",
-          "p5": "空きコマ"
-        }}
-      ]
-    }}
-
-    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
-    - 少なくとも Mon〜Fri の5日分を含めること。
-    - JSON 以外のテキストは出力してはいけません。
-    """
-
-    res = call_gemini(prompt)
-    if not res:
-        default = [
-            {"weekday": "Mon", "p1": "基礎ゼミ", "p2": "統計学Ⅰ", "p3": "空きコマ", "p4": "スポーツ科学入門", "p5": "空きコマ"},
-            {"weekday": "Tue", "p1": "経済学入門", "p2": "英語リーディング", "p3": "空きコマ", "p4": "情報リテラシー", "p5": "空きコマ"},
-            {"weekday": "Wed", "p1": "社会学概論", "p2": "空きコマ", "p3": "第二外国語", "p4": "空きコマ", "p5": "空きコマ"},
-            {"weekday": "Thu", "p1": "憲法学", "p2": "空きコマ", "p3": "スポーツ心理学", "p4": "空きコマ", "p5": "空きコマ"},
-            {"weekday": "Fri", "p1": "空きコマ", "p2": "空きコマ", "p3": "プロジェクト科目", "p4": "空きコマ", "p5": "空きコマ"},
-        ]
-        return {"timetable": default}
-
-    if "timetable" not in res:
-        res["timetable"] = []
-    return res
-
-
-def create_team_weekly_plan(team_name, category):
-    """
-    チームの「曜日ごとの基本スケジュール」を Gemini に作らせる。
-    例：月: OFF / 火: 午前ジム・午後TR など。
-    """
-    prompt = f"""
-    あなたはサッカーコーチ兼スケジューラーAIです。
-
-    [前提]
-    - チーム名: {team_name}
-    - カテゴリ: {category}
-
-    [タスク]
-    このチームの「1週間の基本スケジュール」を作成してください。
-    - 対象: 月曜〜日曜
-    - 各曜日について、
-      - morning: 午前の活動（例: OFF, フィジカル, ミーティング, コンディショニング など）
-      - afternoon: 午後の活動（例: チームトレーニング, 戦術トレーニング など）
-      - evening: 夜の活動（例: 自由, 映像分析, 寮での自習 など）
-      を日本語テキストで1〜2フレーズ程度記述してください。
-
-    カテゴリ別のイメージ:
-    - Professional: 週1〜2日OFF、他の日はトレーニング中心。試合前日は軽め。
-    - University / HighSchool / Youth:
-      学校の授業がある前提で、放課後にトレーニングが入る構成を意識してください。
-
-    [出力形式]
-    次の形式の JSON のみを出力してください:
-
-    {{
-      "plan": [
-        {{
-          "weekday": "Mon",
-          "morning": "OFF",
-          "afternoon": "チームトレーニング（戦術＋ポゼッション）",
-          "evening": "自由 / 映像分析"
-        }}
-      ]
-    }}
-
-    - weekday は "Mon","Tue","Wed","Thu","Fri","Sat","Sun" のいずれか。
-    - 必ず 7 行（7曜日分）を含めてください。
-    - JSON 以外のテキストは出力してはいけません。
-    """
-
-    res = call_gemini(prompt)
-    if not res:
-        # フォールバック：ごく単純なデフォルト
-        default_plan = [
-            {"weekday": "Mon", "morning": "OFF", "afternoon": "チームトレーニング", "evening": "自由"},
-            {"weekday": "Tue", "morning": "ジム", "afternoon": "チームトレーニング", "evening": "自由"},
-            {"weekday": "Wed", "morning": "OFF", "afternoon": "戦術トレーニング", "evening": "映像分析"},
-            {"weekday": "Thu", "morning": "ジム", "afternoon": "チームトレーニング", "evening": "自由"},
-            {"weekday": "Fri", "morning": "軽めの調整", "afternoon": "セットプレー確認", "evening": "自由"},
-            {"weekday": "Sat", "morning": "試合 or 試合前日TR", "afternoon": "試合 or リカバリー", "evening": "自由"},
-            {"weekday": "Sun", "morning": "OFF", "afternoon": "OFF", "evening": "OFF"},
-        ]
-        return {"plan": default_plan}
-
-    if "plan" not in res:
-        # 形式がおかしいときの最低限の保険
-        res["plan"] = []
-    return res
-
-
-def create_schedule_data(team_name, category, year):
-    """
-    チーム名・カテゴリ・年から、現実に近い大会構造と年間スケジュールを Gemini に推定させる。
-    - competitions: 大会メタ情報
-    - schedule: 1年分の試合リスト
-    """
-    prompt = f"""
-    あなたは世界中のサッカー大会構造に詳しいデータアナリストAIです。
-
-    [前提]
-    - チーム名: {team_name}
-    - カテゴリ: {category}
-    - シーズン: {year}年
-
-    [タスク概要]
-    1. 可能な範囲で一般的な知識を使い、
-       このチームが {year} シーズンに参加する可能性が高い大会を列挙してください。
-       - プロクラブの場合:
-         - 国内リーグ (必須)
-         - 国内カップ (原則含める)
-         - 欧州クラブであれば、チャンピオンズリーグ(CL) / ヨーロッパリーグ(EL) /
-           カンファレンスリーグ(ECL)の出場可能性も検討すること。
-       - 高校・大学・ユースの場合:
-         - 地域リーグ（例: 関東リーグ）
-         - インディペンデンスリーグ
-         - 全国大会・カップ戦　などを推定すること。
-
-    2. 各大会について、次のメタ情報を推定してください:
-       - code: "LEAGUE", "CUP", "CL", "EL", "ECL", "REGIONAL", "SCHOOL_CUP" など短い識別子
-       - name: 大会正式名称
-       - type: "league" または "knockout"
-       - priority: 数値 (1=最重要。通常はリーグ > カップ のように設定)
-       - season_start: "{year}-MM-DD" 形式の大会期間開始日（だいたいでよい）
-       - season_end:   "{year}-MM-DD" 形式の大会期間終了日（だいたいでよい）
-       - match_days: 代表的な試合曜日の配列 (例: ["Sat","Sun","Wed"])
-       - team_count: おおよそのチーム数
-       - rounds: リーグの場合は総当たり回数(1 or 2)、
-                 カップの場合はそのチームが最大で到達しうるラウンド数
-       - include_for_player: true/false
-         このゲーム内で扱うべき大会かどうか。マイナー大会は false でもよい。
-
-    3. 上記メタ情報にもとづいて、{year}年のこのチームの年間試合日程を作成してください。
-       制約:
-       - "schedule" には、少なくとも 30 試合以上を含めること。
-       - 国内リーグは現実に近い試合数になるようにすること。
-         - 18〜22チームのホーム&アウェーなら 34〜42 試合が目安。
-       - 国内カップは 1〜6 試合程度でよい（このチームの格に応じて推定してよい）。
-       - 欧州コンペティションは、現実の出場状況を知らない場合でも、
-         出場の可能性が相応にある強豪クラブなら数試合を想定して良い。
-       - 試合間隔はできるだけ 3 日以上あけること。
-       - 明らかなオフシーズン（リーグ終了後〜年末など）は試合を入れない。
-       - "date" は "{year}-01-01"〜"{year}-12-31" の範囲に収めること。
-
-    [出力形式]
-    100% 有効な JSON だけを出力してください。
-    次のスキーマに厳密に従ってください:
-
-    {{
-      "competitions": [
-        {{
-          "code": "LEAGUE",
-          "name": "J1リーグ",
-          "type": "league",
-          "priority": 1,
-          "season_start": "{year}-02-20",
-          "season_end":   "{year}-12-05",
-          "match_days": ["Sat","Sun"],
-          "team_count": 18,
-          "rounds": 2,
-          "include_for_player": true
-        }}
-      ],
-      "schedule": [
-        {{
-          "date": "{year}-02-25",
-          "opponent": "横浜F・マリノス",
-          "home": true,
-          "competition_code": "LEAGUE",
-          "round": "MD1"
-        }}
-      ]
-    }}
-
-    注意:
-    - 上記は例です。実際には {team_name} に合わせた大会・対戦相手・日程を生成してください。
-    - JSON 以外のテキスト（説明文やコメント）は一切出力してはいけません。
-    """
-
-    res = call_gemini(prompt)
-
-    # Gemini から何も返ってこなかったときのフォールバック（日程だけダミー生成）
-    if not res:
-        dummy_schedule = []
-        start = datetime.date(year, 3, 1)
-        for i in range(30):
-            d = start + datetime.timedelta(days=7 * i)
-            dummy_schedule.append({
-                "date": d.isoformat(),
-                "opponent": f"クラブ{i+1}",
-                "home": (i % 2 == 0),
-                "competition_code": "LEAGUE",
-                "round": f"MD{i+1}"
-            })
-        return {"competitions": [], "schedule": dummy_schedule}
-
-    # competitions / schedule が無い場合の保険
-    if "competitions" not in res:
-        res["competitions"] = []
-    if "schedule" not in res:
-        res["schedule"] = []
-
-    return res
-
-
-
-def generate_story(player, topic):
-    prompt = f"""
-    あなたはリアル志向のサッカー小説家です。
-
-    【選手設定】
-    - 名前: {player.name}
-    - 所属クラブ / チーム: {player.team_name}
-    - 年齢: {player.age}
-    - ポジション: {player.position}
-    - 現在の日付: {player.current_date}
-
-    【シーン】
-    - 状況: {topic}
-
-    【執筆方針】
-    - 一人称視点（「僕」）で書くこと。
-    - 地の文と会話文をバランスよく混ぜること。
-    - 感情・身体感覚・周囲の空気感を具体的に描写すること
-      （例: 汗の匂い、スタンドのざわめき、スパイクの音、視線の重さなど）。
-    - ご都合主義ではなく、等身大のリアリティのあるトーン。
-    - 分量の目安は 400〜800字程度。
-
-    Output JSON ONLY:
-    {{
-        "story": "ここに日本語テキストを入れる。改行は \\n を使う。"
-    }}
-    """
-    res = call_gemini(prompt)
-    return res.get("story", "") if res else ""
-
-
-def generate_next_event(player):
-    sorted_npcs = sorted(player.npcs, key=lambda x: abs(float(x.relation)), reverse=True)[:5]
-    npcs_txt = ", ".join([f"{n.role}:{n.name}({n.relation})" for n in sorted_npcs]) or "重要な人間関係はまだ少ない"
-
-    next_match = None
-    if player.schedule:
-        sorted_sched = sorted(player.schedule, key=lambda x: x.get('date', '9999'))
-        for m in sorted_sched:
-            if m.get('date', '9999') >= str(player.current_date):
-                next_match = m
-                break
-    schedule_info = (
-        f"次戦: {next_match.get('date')} vs {next_match.get('opponent','未定')}"
-        if next_match else "次戦予定なし"
-    )
-
-    prompt = f"""
-    あなたはリアル志向のサッカー小説家兼ゲームマスターです。
-
-    【プレイヤー情報】
-    - 名前: {player.name}
-    - 所属: {player.team_name}
-    - カテゴリ: {player.team_category}
-    - ポジション: {player.position}
-    - 年齢: {player.age}
-    - 現在日付: {player.current_date}
-    - 現在CA: {player.ca:.2f}, PA: {player.pa:.2f}
-    - HP: {player.hp}, MP: {player.mp}
-
-    【文脈】
-    - 直近スケジュール情報: {schedule_info}
-    - 関係性が強い/こじれているNPC一覧: {npcs_txt}
-
-    【タスク】
-    - 「今このタイミングで起こりうる、等身大のイベント」を1つ作りなさい。
-      - 例: 練習後のロッカーでの会話 / 寮での夜の独り時間 / 恋人とのすれ違い /
-            監督との面談 / 次戦メンバー発表 など。
-      - サッカー要素と生活要素が両方少しずつ絡むのが理想。
-
-    【表現ルール】
-    - title: 20文字以内の短いイベント名。
-    - description: 400〜900字程度の本文。
-      - 一人称の地の文＋会話文。
-      - 感情・身体感覚・空気感を丁寧に描写。
-      - 直近の試合・序列・練習への不安や期待なども自然に織り込んでよい。
-
-    【選択肢】
-    - choices は必ず3つ。
-    - text: プレイヤーが即座に選べる行動（短文）。
-    - hint: その行動がプレイヤーのキャリアに与えそうな影響のニュアンスを一言で。
-
-    Output JSON ONLY:
-    {{
-      "title": "短いイベント名",
-      "description": "本文テキスト。改行は \\n を使う。",
-      "choices": [
-        {{"text":"...", "hint":"..." }},
-        {{"text":"...", "hint":"..." }},
-        {{"text":"...", "hint":"..." }}
-      ]
-    }}
-    """
-    res = call_gemini(prompt)
-    if not res:
+        pap_raw = sum(self.attributes.get(k, 10.0) for k in keys)
+        pap = 20 + (pap_raw - 9) * (240 / 171)
+        return max(0.0, pap)
+
+    def add_npc(self, npc: NPC) -> None:
+        self.npcs.append(npc)
+
+    def grow_attribute(self, key: str, amount: float) -> None:
+        if key not in self.attributes:
+            return
+        self.attributes[key] = max(1.0, min(20.0, self.attributes[key] + amount))
+        self.ca = self._compute_ca()
+
+    def compute_daily_growth_ca(self, base_intensity: float, performance: float) -> float:
+        # A simple heuristic: base intensity (0-1) scaled by performance (0-1.5)
+        return max(0.0, base_intensity * performance * 5)
+
+    def advance_day(self, days: int = 1) -> None:
+        self.apply_daily_upkeep(days)
+        prev_date = self.current_date
+        self.current_date += datetime.timedelta(days=days)
+        self._handle_age_and_grade_rollover(prev_date, self.current_date)
+
+    def apply_daily_upkeep(self, days: int = 1) -> None:
+        """Reduce HP/MP and funds based on stamina/adaptability and living standard."""
+        level_cost = {"節約": 1000, "標準": 3000, "充実": 8000}
+        cost_per_day = level_cost.get(self.living_standard, 3000)
+        if hasattr(self, "funds"):
+            self.funds = max(0, self.funds - cost_per_day * max(1, days))
+
+        stamina = self.attributes.get("Stamina", 10.0)
+        adapt = self.attributes.get("Adaptability", 10.0)
+        base_drain = 8.0
+        base_drain -= stamina / 3.0
+        base_drain -= adapt / 4.0
+        if self.living_standard == "節約":
+            base_drain += 2.0
+        elif self.living_standard == "充実":
+            base_drain -= 1.0
+        per_day = max(1.0, base_drain)
+        total = int(per_day * max(1, days))
+        self.hp = max(0, self.hp - total)
+
+    def update_hierarchy(self) -> None:
+        def score(member: TeamMember) -> float:
+            base = float(getattr(member, "ca", 0))
+            # 微小な変動を付けることで、CA差が小さい場合に序列が揺らぐ
+            jitter = random.uniform(-2.0, 2.0)
+            return base + jitter
+
+        self.team_members.sort(key=score, reverse=True)
+
+        # CA差5以内はコンディション（仮にHP/MPを参照）でイーブンに揺らす
+        for i in range(len(self.team_members) - 1):
+            a = self.team_members[i]
+            b = self.team_members[i + 1]
+            diff = abs(float(getattr(a, "ca", 0)) - float(getattr(b, "ca", 0)))
+            if diff <= 5:
+                form_factor = (self.hp + self.mp) / 200 if hasattr(self, "hp") else 0.5
+                if diff <= 1 or random.random() < form_factor:
+                    self.team_members[i], self.team_members[i + 1] = b, a
+        # イーブン競争後に序列を付与
+        for idx, member in enumerate(self.team_members, start=1):
+            member.hierarchy = idx
+
+        # プレイヤー自身の序列を保存（UI表示用）
+        my_member = next((m for m in self.team_members if m.name == self.name), None)
+        self.hierarchy = my_member.hierarchy if my_member else None
+
+    def _handle_age_and_grade_rollover(self, old_date: datetime.date, new_date: datetime.date) -> None:
+        """Advance age on birthday and promote school grades at fiscal year end."""
+        # 誕生日: old_date < birthday <= new_date なら年齢を加算
+        if self.birthday:
+            for year in range(old_date.year, new_date.year + 1):
+                bday = self.birthday.replace(year=year)
+                if old_date < bday <= new_date:
+                    self.age += 1
+
+        # 学年進級: 3/31を跨いだら昇級（高校3→卒業、大学4→卒業で据え置き）
+        if self.team_category in ("HighSchool", "University"):
+            for year in range(old_date.year, new_date.year + 1):
+                cutoff = datetime.date(year, 3, 31)
+                if old_date < cutoff <= new_date:
+                    self._promote_grade()
+                    for m in self.team_members:
+                        m.grade = self._promote_grade_label(m.grade)
+                        m.age = max(m.age, 0) + 1
+
+    def _promote_grade(self) -> None:
+        self.grade = self._promote_grade_label(self.grade)
+
+    @staticmethod
+    def _promote_grade_label(grade: str) -> str:
+        match = None
+        if grade:
+            match = grade[0]
+        year_num = None
+        if match and match.isdigit():
+            year_num = int(match)
+        if year_num is None:
+            return grade or ""
+        if year_num >= 4:
+            return "卒業"
+        next_year = year_num + 1
+        if next_year >= 4:
+            return "卒業"
+        return f"{next_year}年"
+
+    # --- Persistence ---------------------------------------------------
+    def to_dict(self) -> Dict:
         return {
-            "title": "静かな一日",
-            "description": "今日は大きな出来事はなかった。\\n\\n寮の部屋で一人、次の練習と試合のことを考えながらストレッチをしている。",
-            "choices": [{"text": "軽く自主練に出る", "hint": "わずかに成長"}]
+            "name": self.name,
+            "position": self.position,
+            "age": self.age,
+            "attributes": self.attributes,
+            "funds": self.funds,
+            "salary": self.salary,
+            "team_name": self.team_name,
+            "team_category": self.team_category,
+            "start_date": self.start_date.isoformat() if self.start_date else None,
+            "birthday": self.birthday.isoformat() if self.birthday else None,
+            "grade": self.grade,
+            "pa": self.pa,
+            "hp": self.hp,
+            "mp": self.mp,
+            "current_date": self.current_date.isoformat(),
+            "schedule": self.schedule,
+            "team_members": [m.to_dict() for m in self.team_members],
+            "npcs": [n.to_dict() for n in self.npcs],
+            "team_weekly_plan": self.team_weekly_plan,
+            "position_apt": self.position_apt,
+            "formation": self.formation,
+            "agent_type": self.agent_type,
+            "competitions": self.competitions,
+            "living_standard": self.living_standard,
+            "school_timetable": self.school_timetable,
+            "transfer_offers": self.transfer_offers,
         }
-    return res
 
-
-def resolve_action(player, choice_text, event_desc):
-    prompt = f"""
-    あなたはリアル志向のサッカーコーチ兼ストーリーテラーです。
-
-    【前提状況】
-    - イベント本文: {event_desc}
-    - プレイヤーの選択: {choice_text}
-
-    【選手情報】
-    - 名前: {player.name}
-    - 所属: {player.team_name}
-    - カテゴリ: {player.team_category}
-    - ポジション: {player.position}
-    - 年齢: {player.age}
-    - 現在日付: {player.current_date}
-    - 現在CA: {player.ca:.2f}, PA: {player.pa:.2f}
-    - HP: {player.hp}, MP: {player.mp}
-
-    【タスク】
-    1. この選択をした結果、その日の出来事がどう展開したかを
-       一人称視点で 400〜800字程度のストーリー(result_story)にまとめること。
-       - 練習・試合内容、周囲の反応、自分の感情や身体感覚、
-         帰り道や夜のベッドの中での反芻までを描いてよい。
-       - 「成功した／失敗した」だけでなく、モヤモヤや学びも描写すること。
-
-    2. その日のサッカー活動強度(Base)と、体感採点に対応するPerformanceを決めること。
-       - Base: TRや試合、自主練の合計。だいたい 0.01〜0.30 の範囲。
-       - Performance: 0.6〜1.5（標準は0.8〜1.0）
-
-    3. 成長させるべき能力(grow_stats)を2〜6個程度選び、
-       それぞれ 0.01〜0.30 程度の微小な成長値を割り当てること。
-       - 行動内容に整合的な能力のみを上げること
-         （例: ハードなフィジカルトレ → Stamina, Strength など）。
-       - JSONのキーは game_data.WEIGHTS にある能力名と一致させること。
-
-    4. 必要に応じて人間関係relation_changeも1件だけ指定してよい。
-       - role: 関係性のラベル（例: "監督", "チームメイト", "恋人" など）
-       - val: -10〜+10の整数。
-
-    【出力フォーマット】
-    以下のJSONだけを出力してください:
-
-    {{
-      "result_story": "本文。改行は \\n を使う。",
-      "grow_stats": {{
-         "Decisions": 0.05,
-         "Acceleration": 0.10
-      }},
-      "hp_cost": 10,
-      "mp_cost": 5,
-      "relation_change": {{
-         "role": "監督",
-         "val": 3
-      }},
-      "base": 0.12,
-      "performance": 0.9
-    }}
-    """
-    return call_gemini(prompt)
-
-
-# ==========================================
-# メインレイアウト
-# ==========================================
-
-if st.session_state.game_phase == "start":
-    st.title("⚽ Football Career AI")
-    if st.button("エントリーシートを書く"):
-        st.session_state.game_phase = "create"
-        st.rerun()
-
-# --- 1. 入力フェーズ ---
-elif st.session_state.game_phase == "create":
-    st.title("📝 選手エントリーシート")
-    if not api_key:
-        st.error("← サイドバー(左上)を開いてAPIキーを設定してください")
-        st.stop()
-
-    with st.expander("基本情報", expanded=True):
-        c1, c2 = st.columns(2)
-        name = c1.text_input("名前", "佐藤 蹴斗")
-        nickname = c2.text_input("ニックネーム", "シュート")
-        c3, c4 = st.columns(2)
-        start_date = c3.date_input("開始日時", datetime.date(2024, 4, 1))
-        dob = c4.date_input("生年月日", datetime.date(2006, 4, 1))
-        age = (start_date - dob).days // 365
-        c5, c6 = st.columns(2)
-        height = c5.number_input("身長 (cm)", 160, 200, 175)
-        weight = c6.number_input("体重 (kg)", 50, 100, 68)
-
-    with st.expander("詳細設定", expanded=True):
-        history = st.text_area("経歴", "高校時代は無名だったが...")
-        style = st.text_area("特徴", "足は速いが、スタミナがない。")
-        relation_desc = st.text_area("人間関係", "父は反対している。")
-        money_desc = st.text_area("経済状況", "実家は太い。")
-        housing = st.text_input("住居", "寮")
-
-        c_pa, c_tm, c_pos = st.columns(3)
-        target_pa = c_pa.slider("希望PA", 1, 200, 150)
-        init_team = c_tm.text_input("初期チーム", "慶應義塾大学ソッカー部C2チーム")
-        position = c_pos.selectbox(
-            "ポジション",
-            ["CF", "RWG", "LWG", "OMF", "CMF", "DMF", "RSB", "LSB", "CB", "GK"]
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Player":
+        start_date = (
+            datetime.date.fromisoformat(data.get("start_date"))
+            if data.get("start_date")
+            else None
         )
-
-    if st.button("データ生成開始"):
-        with st.spinner(f"チームデータを生成中... ({selected_model})"):
-            cat = determine_category(init_team)
-            prof = {
-                "name": name,
-                "age": age,
-                "height": height,
-                "weight": weight,
-                "history": history,
-                "style": style,
-                "relations": relation_desc,
-                "economics": money_desc,
-                "housing": housing,
-                "pa": target_pa,
-                "team": init_team
-            }
-            res = create_initial_data(prof, cat, start_date)
-
-            if res:
-                # 将来的に need_questions を見て追加質問フローを挟む余地を残しておく
-                st.session_state.temp_data = {
-                    "base": prof,
-                    "cat": cat,
-                    "start_date": str(start_date),
-                    "stats": res,
-                    "position": position
-                }
-                st.session_state.game_phase = "review_stats"
-                st.rerun()
-
-# --- 2. Review Stats ---
-elif st.session_state.game_phase == "review_stats":
-    st.title("📊 能力値・人間関係の確認")
-    st.info("AIが生成したデータを編集して確定してください。")
-
-    data = st.session_state.temp_data["stats"]
-
-    # Gemini が返した attributes に、FM準拠の全キーをマージして 10.0 で初期化する
-    raw_attr = data.get("attributes", {}) or {}
-    base_attrs = {k: 10.0 for k in game_data.WEIGHTS.keys()}
-    for k in base_attrs.keys():
-        if k in raw_attr and raw_attr[k] is not None:
-            base_attrs[k] = float(raw_attr[k])
-
-    # CAプレビュー
-    total_score = sum(base_attrs[key] * game_data.WEIGHTS[key] for key in game_data.WEIGHTS.keys())
-    ca_preview = (total_score / game_data.THEORETICAL_MAX_SCORE) * 200
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write("能力値（FM準拠・全項目）")
-        st.caption(f"現在の推定CA: {ca_preview:.2f}")
-        edited_attr = st.data_editor(
-            pd.DataFrame([base_attrs]),
-            use_container_width=True
+        player = cls(
+            name=data.get("name", ""),
+            position=data.get("position", ""),
+            age=int(data.get("age", 18)),
+            attributes=data.get("attributes", {}),
+            funds=int(data.get("funds", 0)),
+            salary=int(data.get("salary", 0)),
+            team_name=data.get("team_name", ""),
+            team_category=data.get("team_category", "Professional"),
+            start_date=start_date,
+            birthday=(
+                datetime.date.fromisoformat(data.get("birthday"))
+                if data.get("birthday")
+                else None
+            ),
+            grade=data.get("grade", ""),
+            pa=float(data.get("pa", 150.0)),
+            hp=int(data.get("hp", 100)),
+            mp=int(data.get("mp", 100)),
         )
-
-    with c2:
-        st.write("人間関係")
-        edited_npcs = st.data_editor(
-            pd.DataFrame(data.get("npcs", [])),
-            num_rows="dynamic"
+        player.current_date = datetime.date.fromisoformat(
+            data.get("current_date", datetime.date.today().isoformat())
         )
+        player.schedule = data.get("schedule", [])
+        player.team_members = [TeamMember(**m) for m in data.get("team_members", [])]
+        player.npcs = [NPC(**n) for n in data.get("npcs", [])]
+        player.team_weekly_plan = data.get("team_weekly_plan", [])
+        player.position_apt = data.get("position_apt", {})
+        player.formation = data.get("formation", "")
+        player.agent_type = data.get("agent_type", "")
+        player.competitions = data.get("competitions", [])
+        player.living_standard = data.get("living_standard", "標準")
+        player.school_timetable = data.get("school_timetable", [])
+        player.transfer_offers = data.get("transfer_offers", [])
+        player.update_hierarchy()
+        return player
 
-        st.write("経済")
-        funds = st.number_input("所持金", value=safe_int(data.get("funds", 100000)))
-        salary = st.number_input("年俸", value=safe_int(data.get("salary", 0)))
 
-    if st.button("確定して入団"):
-        prof = st.session_state.temp_data["base"]
-        start_d = datetime.datetime.strptime(
-            st.session_state.temp_data["start_date"],
-            "%Y-%m-%d"
-        ).date()
+# --- Team generation utilities -------------------------------------------
+class TeamGenerator:
+    DEFAULT_FORMATIONS: Dict[str, str] = {
+        "Professional": "4-3-3",
+        "University": "4-4-2",
+        "HighSchool": "4-4-2",
+        "Youth": "4-3-3",
+    }
 
-        pos_val = st.session_state.temp_data.get("position", "MF")
+    LAST_NAMES = [
+        "佐藤", "鈴木", "高橋", "田中", "伊藤", "渡辺", "山本", "中村", "小林", "加藤",
+        "吉田", "山田", "佐々木", "山口", "松本", "井上", "木村", "林", "斎藤", "清水",
+        "阿部", "森", "池田", "橋本", "山崎", "石川", "石井", "松田", "野口", "村上",
+        "岡本", "酒井", "長谷川", "藤田", "西村", "原田", "福田", "岡田", "中島", "藤井",
+        "青木", "上田", "柴田", "宮崎", "前田", "秋山", "北川", "久保", "堂安", "南野",
+        "安部", "鎌田", "冨安", "遠藤", "田畑", "大森", "大谷", "川崎", "島田", "榊原",
+        "石原", "杉本", "川口", "吉岡", "前川", "栗原", "福島", "黒田", "永田", "近藤",
+    ]
+    FIRST_NAMES = [
+        "太一", "翔太", "大輔", "悠斗", "颯太", "陽向", "健太", "蓮", "大和", "隼人",
+        "蒼", "拓海", "悠真", "陽翔", "結衣", "陽菜", "美咲", "さくら", "真央", "愛",
+        "結愛", "心春", "凜", "紗季", "美月", "琴音", "瑛斗", "蒼空", "海斗", "涼介",
+        "悠生", "瑠偉", "航太", "勇人", "隼人", "大智", "聡太", "玲央", "陽大", "恭介",
+        "結菜", "美波", "愛莉", "心乃", "莉子", "心愛", "陽葵", "美羽", "七海", "杏奈",
+    ]
 
-        p = game_data.Player(
-            prof["name"],
-            pos_val,
-            prof["age"],
-            attributes=edited_attr.to_dict(orient='records')[0],
-            funds=funds,
-            salary=salary,
-            team_name=prof["team"],
-            start_date=start_d
-        )
-        p.pa = float(st.session_state.temp_data["base"]["pa"])
-        p.team_category = st.session_state.temp_data["cat"]
+    POSITIONS_POOL = [
+        "GK", "RSB", "CB", "LSB", "DMF", "CMF", "OMF", "RWG", "LWG", "CF"
+    ]
 
-        for _, row in edited_npcs.iterrows():
-            p.add_npc(
-                game_data.NPC(
-                    row.get("name"),
-                    row.get("role"),
-                    safe_float(row.get("relation")),
-                    row.get("description")
+    @classmethod
+    def _random_name(cls) -> str:
+        return f"{random.choice(cls.LAST_NAMES)} {random.choice(cls.FIRST_NAMES)}"
+
+    @staticmethod
+    def _sample_ca(category: str) -> float:
+        roll = random.random()
+        if category == "HighSchool":
+            # 0.5% for 80+, smooth tapering above 60
+            if roll > 0.995:
+                return random.uniform(80, 90)
+            if roll > 0.97:
+                return random.uniform(70, 80)
+            if roll > 0.9:
+                return random.uniform(60, 70)
+            if roll > 0.7:
+                return random.uniform(50, 60)
+            if roll > 0.45:
+                return random.uniform(40, 50)
+            if roll > 0.15:
+                return random.uniform(30, 40)
+            return random.uniform(20, 30)
+        if category == "University":
+            if roll > 0.995:
+                return random.uniform(100, 110)
+            if roll > 0.97:
+                return random.uniform(90, 100)
+            if roll > 0.9:
+                return random.uniform(80, 90)
+            if roll > 0.75:
+                return random.uniform(70, 80)
+            if roll > 0.55:
+                return random.uniform(60, 70)
+            if roll > 0.35:
+                return random.uniform(50, 60)
+            if roll > 0.15:
+                return random.uniform(40, 50)
+            return random.uniform(30, 40)
+        # professional / youth fallback
+        return random.uniform(70, 130)
+
+    @staticmethod
+    def _sample_pa() -> float:
+        roll = random.random()
+        if roll > 0.999:
+            return random.uniform(150, 170)
+        if roll > 0.995:
+            return random.uniform(140, 150)
+        if roll > 0.98:
+            return random.uniform(130, 140)
+        if roll > 0.96:
+            return random.uniform(120, 130)
+        if roll > 0.9:
+            return random.uniform(110, 120)
+        if roll > 0.7:
+            return random.uniform(90, 110)
+        if roll > 0.5:
+            return random.uniform(80, 90)
+        if roll > 0.3:
+            return random.uniform(70, 80)
+        return random.uniform(50, 70)
+
+    @staticmethod
+    def _sample_height(position: str) -> int:
+        pos_upper = position.upper()
+        roll = random.random()
+        is_center_forward = any(tag in pos_upper for tag in ["CF", "RCF", "LCF"])
+        is_center_back = any(tag in pos_upper for tag in ["CB", "RCB", "LCB"])
+        if pos_upper == "GK":
+            if roll > 0.8:
+                return random.randint(190, 197)
+            if roll > 0.1:
+                return random.randint(180, 189)
+            if roll > 0.0:
+                return random.randint(170, 179)
+        if is_center_back or is_center_forward:
+            if roll > 0.95:
+                return random.randint(190, 195)
+            if roll > 0.35:
+                return random.randint(180, 189)
+            if roll > 0.15:
+                return random.randint(170, 179)
+            return random.randint(165, 169)
+        # fullbacks/wingers/others
+        if roll > 0.85:
+            return random.randint(185, 192)
+        if roll > 0.2:
+            return random.randint(175, 184)
+        return random.randint(165, 174)
+
+    @classmethod
+    def _grade_label(cls, category: str, age: int) -> str:
+        if category == "HighSchool":
+            if age <= 15:
+                return "1年"
+            if age == 16:
+                return "2年"
+            return "3年"
+        if category == "University":
+            if age <= 18:
+                return "1年"
+            if age == 19:
+                return "2年"
+            if age == 20:
+                return "3年"
+            return "4年"
+        return ""
+
+    @classmethod
+    def generate_teammates(
+        cls, category: str, formation: str, real_players: List[Dict]
+    ) -> Tuple[List[TeamMember], str]:
+        formation = formation or cls.DEFAULT_FORMATIONS.get(category, "4-4-2")
+        members: List[TeamMember] = []
+
+        for p in real_players:
+            age = int(p.get("age", 22))
+            members.append(
+                TeamMember(
+                    name=p.get("name", cls._random_name()),
+                    position=p.get("position", random.choice(cls.POSITIONS_POOL)),
+                    number=int(p.get("number", len(members) + 1)),
+                    age=age,
+                    ca=float(p.get("ca", cls._sample_ca(category))),
+                    pa=float(p.get("pa", cls._sample_pa())),
+                    height_cm=int(p.get("height_cm", cls._sample_height(p.get("position", "")))),
+                    value=int(p.get("value", random.randint(50_000, 500_000))),
+                    grade=cls._grade_label(category, age),
                 )
             )
 
-        st.session_state.player = p
-
-        # カテゴリに応じて次フェーズを分岐
-        cat_raw = p.team_category or ""
-        cat_norm = cat_raw.lower()
-
-        if ("professional" in cat_norm) or ("pro" in cat_norm):
-            st.session_state.game_phase = "agent_choice"
-        elif "youth" in cat_norm:
-            st.session_state.game_phase = "agent_choice"
-        elif ("highschool" in cat_norm) or ("高校" in cat_raw):
-            st.session_state.game_phase = "team_intro"
-        elif ("university" in cat_norm) or ("大学" in cat_raw):
-            st.session_state.game_phase = "team_intro"
-        else:
-            st.session_state.game_phase = "team_intro"
-
-        st.rerun()
-
-# --- 2.5 代理人選択 ---
-elif st.session_state.game_phase == "agent_choice":
-    p = st.session_state.player
-    st.title("🤝 代理人の選択")
-
-    st.write(
-        "これからのキャリアを考えて、代理人（エージェント）を付けるかどうかを決めます。"
-        "ここでは物語とニュアンスだけに影響し、まだ契約条件ロジックには直結させません。"
-    )
-
-    default_index = 2 if p.team_category == "Professional" else 1
-    option = st.radio(
-        "あなたの現在の状況に一番近いものを選んでください。",
-        ["付けない", "身近な人が兼ねる（家族・先輩など）", "専任のエージェントが付いている"],
-        index=default_index
-    )
-
-    if st.button("決定して次へ"):
-        # とりあえずプレイヤーオブジェクトにぶら下げる（セーブは後で考える）
-        p.agent_type = option
-
-        if p.team_category == "Professional":
-            st.session_state.game_phase = "pro_contract"
-        else:
-            # ユースはすぐに入団会見へ
-            st.session_state.game_phase = "story_intro"
-
-        st.rerun()
-
-# --- 2.6 プロ限定：契約交渉 ---
-elif st.session_state.game_phase == "pro_contract":
-    p = st.session_state.player
-    st.title("📝 契約交渉")
-
-    if "pro_contract_story" not in st.session_state:
-        with st.spinner("契約交渉のシーンを生成中..."):
-            st.session_state.pro_contract_story = generate_story(
-                p,
-                "代理人（または自分）とクラブが年俸や契約年数について詰めている契約交渉のシーン"
+        while len(members) < 25:
+            age = random.randint(17, 34)
+            members.append(
+                TeamMember(
+                    name=cls._random_name(),
+                    position=random.choice(cls.POSITIONS_POOL),
+                    number=len(members) + 1,
+                    age=age,
+                    ca=cls._sample_ca(category),
+                    pa=cls._sample_pa(),
+                    height_cm=cls._sample_height(random.choice(cls.POSITIONS_POOL)),
+                    value=random.randint(10_000, 200_000),
+                    grade=cls._grade_label(category, age),
+                )
             )
 
-    st.markdown(st.session_state.pro_contract_story)
+        return members, formation
 
-    # いまは条件いじらず、演出だけ
-    if st.button("契約にサインする"):
-        del st.session_state.pro_contract_story
-        st.session_state.game_phase = "story_intro"
-        st.rerun()
-
-# --- 3. Story Intro（プロ・ユースの入団会見） ---
-elif st.session_state.game_phase == "story_intro":
-    p = st.session_state.player
-    st.title("🎬 入団")
-
-    if "intro_text" not in st.session_state:
-        with st.spinner("物語を生成中..."):
-            if p.team_category in ["Professional", "Youth"]:
-                topic = "入団会見とメディア向けフォトセッション"
-            else:
-                topic = "部室での自己紹介"
-            st.session_state.intro_text = generate_story(p, topic)
-
-    st.markdown(st.session_state.intro_text)
-
-    if st.button("チームメイトと対面する"):
-        # プロ/ユースはここからチーム内自己紹介へ
-        st.session_state.game_phase = "team_intro"
-        del st.session_state.intro_text
-        st.rerun()
-
-# --- 3.5 チーム内自己紹介（全カテゴリ共通） ---
-elif st.session_state.game_phase == "team_intro":
-    p = st.session_state.player
-    st.title("👥 チーム内自己紹介")
-
-    if "intro_text" not in st.session_state:
-        with st.spinner("自己紹介シーンを生成中..."):
-            if p.team_category in ["University", "HighSchool"]:
-                topic = "部室での自己紹介と、先輩・同級生との最初の会話"
-            elif p.team_category in ["Professional", "Youth"]:
-                topic = "ロッカールームでの自己紹介と、チームメイトとの最初のやり取り"
-            else:
-                topic = "チームメイトへの自己紹介"
-
-            st.session_state.intro_text = generate_story(p, topic)
-
-    st.markdown(st.session_state.intro_text)
-
-    if st.button("チームメイト一覧を確認する"):
-        del st.session_state.intro_text
-        st.session_state.game_phase = "review_team"
-        st.rerun()
-
-# --- 4. Review Team ---
-elif st.session_state.game_phase == "review_team":
-    st.title("👥 チームメイト確認")
-    p = st.session_state.player
-
-    if not p.team_members:
-        with st.spinner("チームデータを生成中..."):
-            # 念のためここで再度カテゴリをチーム名から強制判定
-            p.team_category = determine_category(p.team_name)
-
-            res = create_team_data(p.team_name, p.team_category, p.current_date)
-            if res:
-                p.formation = res.get("formation", "4-4-2")
-                members, fmt = game_data.TeamGenerator.generate_teammates(
-                    p.team_category,
-                    p.formation,
-                    res.get("real_players", [])
+    @classmethod
+    def finalize_team(
+        cls, category: str, formation: str, raw_members: List[Dict]
+    ) -> List[TeamMember]:
+        finalized: List[TeamMember] = []
+        for m in raw_members:
+            age = int(m.get("age", 20))
+            finalized.append(
+                TeamMember(
+                    name=m.get("name", cls._random_name()),
+                    position=m.get("position", random.choice(cls.POSITIONS_POOL)),
+                    number=int(m.get("number", m.get("No", len(finalized) + 1))),
+                    age=age,
+                    ca=float(m.get("ca", m.get("CA", 80.0))),
+                    pa=float(m.get("pa", m.get("PA", 120.0))),
+                    height_cm=int(m.get("height_cm", cls._sample_height(m.get("position", "")))),
+                    value=int(m.get("value", m.get("Value", 0))),
+                    grade=m.get("grade") or cls._grade_label(category, age),
                 )
-                p.team_members = members
-                game_data.save_game(p)
-
-    st.info("メンバーを編集し、確定ボタンを押すと序列が計算されます。")
-
-    data = []
-    for m in p.team_members:
-        data.append({
-            "No": m.number,
-            "Pos": m.position,
-            "Name": m.name,
-            "Age": m.age,
-            "CA": float(m.ca),
-            "PA": float(getattr(m, "pa", 0)),
-            "Value": int(getattr(m, "value", 0))
-        })
-    edited_df = st.data_editor(
-        pd.DataFrame(data),
-        num_rows="dynamic",
-        use_container_width=True
-    )
-
-    if st.button("メンバー確定 & 序列計算"):
-        raw_members = []
-        for _, row in edited_df.iterrows():
-            raw_members.append({
-                "number": row.get("No"),
-                "position": row.get("Pos"),
-                "name": row.get("Name"),
-                "age": row.get("Age"),
-                "ca": row.get("CA"),
-                "pa": row.get("PA"),
-                "value": row.get("Value")
-            })
-
-        p.team_members = game_data.TeamGenerator.finalize_team(
-            p.team_category,
-            p.formation,
-            raw_members
-        )
-        p.update_hierarchy()
-        game_data.save_game(p)
-
-        st.session_state.game_phase = "story_hierarchy"
-        st.rerun()
-
-# --- 5. Story Hierarchy ---
-elif st.session_state.game_phase == "story_hierarchy":
-    p = st.session_state.player
-    st.title("📋 序列発表")
-
-    st.success(f"あなたの現在の序列: **{p.hierarchy}**")
-
-    my_idx = next((i for i, m in enumerate(p.team_members) if m.name == p.name), 0)
-    rivals = p.team_members[max(0, my_idx - 2): min(len(p.team_members), my_idx + 3)]
-    st.write("### ポジション争い")
-    for m in rivals:
-        mark = "👈 YOU" if m.name == p.name else ""
-        st.write(f"{m.hierarchy} | {m.name} (CA:{m.ca:.1f}) {mark}")
-
-    # ★変更：まずはチームの週間スケジュールを見に行く
-    if st.button("チームの週間スケジュールを見る"):
-        st.session_state.game_phase = "team_weekly_plan"
-        st.rerun()
-# --- 5.5 Team Weekly Plan ---
-elif st.session_state.game_phase == "team_weekly_plan":
-    p = st.session_state.player
-    st.title("🗓 チームの週間スケジュール")
-
-    # まだ作っていなければ Gemini で生成
-    if not getattr(p, "team_weekly_plan", None):
-        with st.spinner("チームの週間スケジュールを作成中..."):
-            res = create_team_weekly_plan(p.team_name, p.team_category)
-            if res:
-                p.team_weekly_plan = res.get("plan", [])
-                game_data.save_game(p)
-
-    st.info("コーチ陣が決めたベースの週間スケジュールです。必要なら編集してください。")
-
-    if p.team_weekly_plan:
-        df_plan = pd.DataFrame(p.team_weekly_plan)
-    else:
-        df_plan = pd.DataFrame(columns=["weekday", "morning", "afternoon", "evening"])
-
-    edited_plan = st.data_editor(
-        df_plan,
-        num_rows="dynamic",
-        use_container_width=True
-    )
-
-    if st.button("確定して次へ"):
-        p.team_weekly_plan = edited_plan.to_dict(orient="records")
-        game_data.save_game(p)
-
-        # ★カテゴリ・年齢に応じて遷移先を分岐
-        if p.team_category == "University":
-            st.session_state.game_phase = "univ_timetable"
-        elif p.team_category in ["HighSchool", "Youth"] and p.age <= 18:
-            st.session_state.game_phase = "school_timetable"
-        else:
-            # 社会人・プロなどはそのまま年間日程へ
-            st.session_state.game_phase = "review_schedule"
-
-        st.rerun()
-
-# --- 5.6 School Timetable (HighSchool / Youth <=18) ---
-elif st.session_state.game_phase == "school_timetable":
-    p = st.session_state.player
-    st.title("🏫 学校の時間割")
-
-    if not getattr(p, "school_timetable", None):
-        with st.spinner("学校の時間割を作成中..."):
-            res = create_school_timetable(p)
-            if res:
-                p.school_timetable = res.get("timetable", [])
-                game_data.save_game(p)
-
-    st.info("担任や進路指導の先生と相談して決めた、あなたの学校の時間割です。必要なら少し編集してください。")
-
-    if p.school_timetable:
-        df_tt = pd.DataFrame(p.school_timetable)
-    else:
-        df_tt = pd.DataFrame(columns=["weekday", "p1", "p2", "p3", "p4", "p5", "p6"])
-
-    edited_tt = st.data_editor(
-        df_tt,
-        num_rows="dynamic",
-        use_container_width=True
-    )
-
-    if st.button("確定して年間日程へ進む"):
-        p.school_timetable = edited_tt.to_dict(orient="records")
-        game_data.save_game(p)
-        st.session_state.game_phase = "review_schedule"
-        st.rerun()
-
-# --- 5.7 Univ Timetable (履修登録) ---
-elif st.session_state.game_phase == "univ_timetable":
-    p = st.session_state.player
-    st.title("🎓 履修登録（時間割）")
-
-    if not getattr(p, "school_timetable", None):
-        with st.spinner("履修時間割を作成中..."):
-            res = create_univ_timetable(p)
-            if res:
-                # 大学でも school_timetable にまとめて持たせる
-                p.school_timetable = res.get("timetable", [])
-                game_data.save_game(p)
-
-    st.info("サッカー部の予定と両立できるように、AIが提案した履修時間割です。必要に応じて講義名や空きコマを編集してください。")
-
-    if p.school_timetable:
-        df_tt = pd.DataFrame(p.school_timetable)
-    else:
-        df_tt = pd.DataFrame(columns=["weekday", "p1", "p2", "p3", "p4", "p5"])
-
-    edited_tt = st.data_editor(
-        df_tt,
-        num_rows="dynamic",
-        use_container_width=True
-    )
-
-    if st.button("確定して年間日程へ進む"):
-        p.school_timetable = edited_tt.to_dict(orient="records")
-        game_data.save_game(p)
-        st.session_state.game_phase = "review_schedule"
-        st.rerun()
-
-
-# --- 6. Review Schedule ---
-elif st.session_state.game_phase == "review_schedule":
-    st.title("📅 スケジュール確認")
-    p = st.session_state.player
-
-    if not p.schedule:
-        with st.spinner("リーグ日程を編成中..."):
-            res = create_schedule_data(p.team_name, p.team_category, p.current_date.year)
-            if res:
-                # 大会メタ情報（今はまだ画面には出さないが、今後の順位表などで使う）
-                if hasattr(p, "competitions"):
-                    p.competitions = res.get("competitions", [])
-                # 実際に使う年間日程
-                p.schedule = res.get("schedule", [])
-                game_data.save_game(p)
-
-    edited_sched = st.data_editor(
-        pd.DataFrame(p.schedule),
-        num_rows="dynamic",
-        use_container_width=True
-    )
-
-    if st.button("日程確定 & シーズン開幕"):
-        p.schedule = edited_sched.to_dict(orient='records')
-        game_data.save_game(p)
-        st.session_state.game_phase = "story_schedule"
-        st.rerun()
-
-
-# --- 7. Story Schedule ---
-elif st.session_state.game_phase == "story_schedule":
-    p = st.session_state.player
-    st.title("⚽ シーズン開幕")
-    if p.schedule:
-        opener = p.schedule[0]
-        st.info(f"開幕戦は **{opener.get('date')}** vs **{opener.get('opponent')}** です！")
-
-    if st.button("日常パートへ"):
-        st.session_state.game_phase = "main"
-        ev = generate_next_event(p)
-        st.session_state.current_event = ev
-        st.rerun()
-
-# --- 8. Main ---
-elif st.session_state.game_phase == "main":
-    p = st.session_state.player
-    p.update_hierarchy()
-
-    st.markdown(
-        f"## ⚽ {p.name} <small>({p.team_name})</small>",
-        unsafe_allow_html=True
-    )
-    col_main, col_chat = st.columns([7, 3])
-
-    # =========================
-    # 左カラム：ステータス & 各種メニュー
-    # =========================
-    with col_main:
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-
-        # Date
-        render_stat(c1, "Date", str(p.current_date))
-
-        # Funds（長い桁数でも折り返して表示）
-        render_stat(c2, "Funds (¥)", f"{p.funds:,}")
-
-        # CA / PA
-        render_stat(c3, "CA / PA", f"{p.ca:.2f} / {p.pa:.2f}")
-
-        # Market Value（€）
-        render_stat(c4, "Value (€)", f"{int(p.value):,}")
-
-        # HP / MP
-        render_stat(c5, "HP", f"{p.hp}")
-        render_stat(c6, "MP", f"{p.mp}")
-
-        tab_attr, tab_roster, tab_year, tab_week, tab_timetable, tab_rel, tab_shop, tab_transfer = st.tabs(
-            ["📊 能力/適性", "👥 名簿", "📅 年間日程", "🗓 週間日程", "⏰ 時間割", "🤝 人間関係", "🛍️ ショップ", "📩 移籍"]
-        )
-
-        # ========== タブ: 能力 / ポジション適性 ==========
-        with tab_attr:
-            # 能力値一覧
-            attr_rows = [
-                {"Ability": k, "Value": round(v, 2)}
-                for k, v in p.attributes.items()
-            ]
-            if attr_rows:
-                st.write("### 能力値一覧")
-                st.dataframe(
-                    pd.DataFrame(attr_rows).sort_values("Ability"),
-                    use_container_width=True,
-                    height=400
-                )
-            else:
-                st.info("能力値データがありません。")
-
-            # ポジション適性
-            if hasattr(p, "position_apt"):
-                st.write("### ポジション適性")
-                apt_rows = [
-                    {"Position": pos, "Aptitude": round(val, 2)}
-                    for pos, val in p.position_apt.items()
-                ]
-                st.dataframe(
-                    pd.DataFrame(apt_rows).sort_values("Position"),
-                    use_container_width=True,
-                    height=300
-                )
-            else:
-                st.info("ポジション適性データがありません。")
-
-        # ========== タブ: 名簿 ==========
-        with tab_roster:
-            data = []
-            sorted_members = sorted(
-                p.team_members,
-                key=lambda x: float(x.ca) if getattr(x, "ca", None) is not None else 0,
-                reverse=True
             )
-            for m in sorted_members:
-                is_me = (m.name == p.name)
-                row = {
-                    "No": m.number,
-                    "Pos": m.position,
-                    "Name": f"★ {m.name}" if is_me else m.name,
-                    "CA": f"{getattr(m, 'ca', 0):.1f}",
-                    "PA": f"{getattr(m, 'pa', 0):.1f}",
-                    "Hierarchy": getattr(m, "hierarchy", ""),
-                    "Foot": getattr(m, "foot", ""),
-                    "Height": getattr(m, "height", ""),
-                    "Value": f"€{getattr(m, 'value', 0):,}"
-                }
-                # 高校・大学のときは年齢も見えた方が嬉しいので常に入れる
-                row["Age"] = getattr(m, "age", "")
-                data.append(row)
+        return finalized
 
-            if data:
-                st.dataframe(
-                    pd.DataFrame(data),
-                    height=500,
-                    use_container_width=True
-                )
-            else:
-                st.info("チームメンバーがまだいません。")
 
-        # ========== タブ: 年間日程 ==========
-        with tab_year:
-            if p.schedule:
-                st.dataframe(
-                    pd.DataFrame(p.schedule),
-                    use_container_width=True,
-                    height=500
-                )
-            else:
-                st.info("年間日程がまだ編成されていません。")
+# --- Persistence helpers --------------------------------------------------
+SAVE_PATH = Path("save.json")
 
-        # ========== タブ: 週間日程（現在日付から7日分） ==========
-        with tab_week:
-            from datetime import timedelta
 
-            rows = []
-            for i in range(7):
-                d = p.current_date + timedelta(days=i)
-                d_str = str(d)
-                match = None
-                for m in p.schedule or []:
-                    if m.get("date") == d_str:
-                        match = m
-                        break
-                if match:
-                    kind = "試合"
-                    detail = f"vs {match.get('opponent', '')} ({'H' if match.get('home') else 'A'})"
-                else:
-                    kind = "トレーニング / 休養"
-                    detail = "-"
-                rows.append({
-                    "Date": d_str,
-                    "Type": kind,
-                    "Detail": detail
-                })
+def save_game(player: Player, path: Path = SAVE_PATH) -> None:
+    path.write_text(json.dumps(player.to_dict(), ensure_ascii=False, indent=2))
 
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                height=300
-            )
-            st.caption("※ ざっくりプレビュー。詳細ロジックは今後拡張余地あり。")
 
-        # ========== タブ: 時間割 ==========
-        with tab_timetable:
-            st.write("### 時間割（カテゴリ別の目安）")
-            if p.team_category in ["University", "HighSchool", "Youth"]:
-                if p.team_category == "University":
-                    st.markdown(
-                        """
-**大学生イメージ（平日）**
-
-- 07:00 起床・朝食  
-- 09:00〜12:00 授業 / 自習  
-- 12:00〜13:00 昼食  
-- 13:00〜16:00 授業 / 課題 / バイト  
-- 17:00〜20:00 部活動（トレーニング・ミーティング）  
-- 21:00〜24:00 自由時間 / 復習 / リカバリー
-                        """
-                    )
-                elif p.team_category == "HighSchool":
-                    st.markdown(
-                        """
-**高校生イメージ（平日）**
-
-- 07:00 起床・登校  
-- 08:30〜15:30 授業  
-- 16:00〜19:00 部活動（トレーニング・試合）  
-- 20:00〜22:30 夕食・宿題・自由時間
-                        """
-                    )
-                else:  # Youth
-                    st.markdown(
-                        """
-**ユース（U18）イメージ**
-
-- 08:30〜13:00 学校  
-- 15:00〜18:00 クラブトレーニング  
-- 19:00〜22:00 夕食・宿題・リカバリー
-                        """
-                    )
-            else:
-                st.markdown(
-                    """
-**プロカテゴリ**
-
-- 個人スケジュールはクラブとエージェントの裁量が大きいため、  
-  ここでは詳細時間割の管理は行っていません（今後実装余地あり）。
-                    """
-                )
-
-        # ========== タブ: 人間関係 ==========
-        with tab_rel:
-            if p.npcs:
-                rel_rows = []
-                for n in p.npcs:
-                    rel_rows.append({
-                        "Role": n.role,
-                        "Name": n.name,
-                        "Relation": n.relation,
-                        "Description": n.description
-                    })
-                st.dataframe(
-                    pd.DataFrame(rel_rows),
-                    use_container_width=True,
-                    height=400
-                )
-            else:
-                st.info("人間関係データがまだありません。")
-
-        # ========== タブ: ショップ ==========
-        with tab_shop:
-            st.write("アイテムショップ")
-            items = [
-                {"name": "プロテイン", "price": 5000},
-                {"name": "戦術書", "price": 10000}
-            ]
-            for item in items:
-                if st.button(f"{item['name']} (¥{item['price']})", key=f"shop_{item['name']}"):
-                    if p.funds >= item['price']:
-                        p.funds -= item['price']
-                        p.hp = min(100, p.hp + 30)
-                        st.toast("購入")
-                        game_data.save_game(p)
-                        st.rerun()
-                    else:
-                        st.error("金欠")
-
-        # ========== タブ: 移籍 ==========
-        with tab_transfer:
-            st.write("オファーなし（今はダミー表示）")
-
-    # =========================
-    # 右カラム：ログ & 行動・イベント
-    # =========================
-    with col_chat:
-        # 先にイベント状態だけ取得しておく
-        ev = st.session_state.current_event
-
-        # =========================
-        # 上：ログ表示
-        # =========================
-        st.markdown("### 📜 ログ")
-        with st.container(height=400):
-            for m in st.session_state.messages:
-                st.chat_message(m["role"]).write(m["content"])
-
-        # =========================
-        # 下：行動 / イベント
-        # =========================
-        st.markdown("### 🏃 行動 / イベント")
-
-        # イベントがない → 「時間を進める」ボタンだけ
-        if not ev:
-            if st.button("時間を進める", key="advance_time_main"):
-                with st.spinner("イベント生成中..."):
-                    ev_new = generate_next_event(p)
-                    st.session_state.current_event = ev_new
-                    st.rerun()
-        else:
-            # イベント表示
-            if isinstance(ev, str):
-                ev = {"title": "Ev", "description": ev, "choices": []}
-            st.markdown(f"**{ev.get('title')}**")
-            st.info(ev.get('description'))
-
-            # 選択肢ボタン
-            choices = ev.get('choices', [])
-            if choices:
-                cols = st.columns(len(choices))
-                for i, c in enumerate(choices):
-                    if cols[i].button(c.get('text'), help=c.get('hint'), key=f"choice_{i}"):
-                        res = resolve_action(p, c.get('text'), ev.get('description'))
-                        if res:
-                            # ログ追加
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": f"**{c.get('text')}**\n{res.get('result_story')}"
-                            })
-
-                            # 成長処理
-                            grow_stats = res.get("grow_stats", {})
-                            base_intensity = safe_float(res.get("base", 0.0))
-                            performance = safe_float(res.get("performance", 0.8))
-                            if base_intensity <= 0:
-                                base_intensity = 0.05
-
-                            target_ca_gain = p.compute_daily_growth_ca(
-                                base_intensity,
-                                performance
-                            )
-
-                            raw_gain = 0.0
-                            if grow_stats:
-                                tmp_attrs = p.attributes.copy()
-                                for k, v in grow_stats.items():
-                                    if k in tmp_attrs:
-                                        tmp_attrs[k] = min(
-                                            20.0,
-                                            tmp_attrs[k] + safe_float(v)
-                                        )
-                                tmp_total = sum(
-                                    tmp_attrs[key] * game_data.WEIGHTS[key]
-                                    for key in game_data.WEIGHTS.keys()
-                                )
-                                tmp_ca = (tmp_total / game_data.THEORETICAL_MAX_SCORE) * 200
-                                raw_gain = max(0.0, tmp_ca - p.ca)
-
-                            scale = 1.0
-                            if target_ca_gain > 0 and raw_gain > 0:
-                                scale = target_ca_gain / raw_gain
-
-                            for k, v in grow_stats.items():
-                                p.grow_attribute(k, safe_float(v) * scale)
-
-                            p.hp -= safe_int(res.get("hp_cost", 0))
-                            p.mp -= safe_int(res.get("mp_cost", 0))
-                            p.advance_day(1)
-                            st.session_state.current_event = None
-                            game_data.save_game(p)
-                            st.rerun()
-
-        # 自由記述アクション
-        if ev:
-            free = st.chat_input("自由記述で行動する", key="free_action")
-            if free:
-                res = resolve_action(p, free, ev.get('description'))
-                if res:
-                    st.session_state.messages.append({"role": "user", "content": free})
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": res.get('result_story')
-                    })
-
-                    grow_stats = res.get("grow_stats", {})
-                    base_intensity = safe_float(res.get("base", 0.0))
-                    performance = safe_float(res.get("performance", 0.8))
-                    if base_intensity <= 0:
-                        base_intensity = 0.05
-
-                    target_ca_gain = p.compute_daily_growth_ca(
-                        base_intensity,
-                        performance
-                    )
-
-                    raw_gain = 0.0
-                    if grow_stats:
-                        tmp_attrs = p.attributes.copy()
-                        for k, v in grow_stats.items():
-                            if k in tmp_attrs:
-                                tmp_attrs[k] = min(
-                                    20.0,
-                                    tmp_attrs[k] + safe_float(v)
-                                )
-                        tmp_total = sum(
-                            tmp_attrs[key] * game_data.WEIGHTS[key]
-                            for key in game_data.WEIGHTS.keys()
-                        )
-                        tmp_ca = (tmp_total / game_data.THEORETICAL_MAX_SCORE) * 200
-                        raw_gain = max(0.0, tmp_ca - p.ca)
-
-                    scale = 1.0
-                    if target_ca_gain > 0 and raw_gain > 0:
-                        scale = target_ca_gain / raw_gain
-
-                    for k, v in grow_stats.items():
-                        p.grow_attribute(k, safe_float(v) * scale)
-
-                    p.hp -= safe_int(res.get("hp_cost", 0))
-                    p.mp -= safe_int(res.get("mp_cost", 0))
-                    p.advance_day(1)
-                    st.session_state.current_event = None
-                    game_data.save_game(p)
-                    st.rerun()
+def load_game(path: Path = SAVE_PATH) -> Optional[Player]:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    try:
+        return Player.from_dict(data)
+    except Exception:
+        return None
